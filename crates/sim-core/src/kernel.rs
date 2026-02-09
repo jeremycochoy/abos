@@ -71,9 +71,16 @@ impl Kernel {
     }
 
     fn schedule_lifecycle(&mut self, config: &SimulationConfig, num_agents: usize) {
-        for &sym in &config.symbols {
-            self.push(config.start_time, EventPayload::MarketOpen { symbol: sym });
-            self.push(config.end_time, EventPayload::MarketClose { symbol: sym });
+        if config.no_market_hours {
+            // Always-open mode: open immediately, never close.
+            for ex in &mut self.exchanges {
+                ex.open(config.start_time);
+            }
+        } else {
+            for &sym in &config.symbols {
+                self.push(config.start_time, EventPayload::MarketOpen { symbol: sym });
+                self.push(config.end_time, EventPayload::MarketClose { symbol: sym });
+            }
         }
         for agent_id in 0..num_agents {
             self.push(config.start_time, EventPayload::WakeUp { agent_id });

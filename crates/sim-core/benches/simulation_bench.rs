@@ -1,17 +1,15 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 
 use agents::{ZiAgent, ZiAgentConfig};
-use sim_core::{Agent, Kernel, LatencyConfig, SimulationConfig};
+use sim_core::{Agent, Kernel, LatencyConfig, LatencyModelType, SimulationConfig};
 
 fn make_agents(n: usize, seed: u64) -> Vec<Box<dyn Agent>> {
     let cfg = ZiAgentConfig {
-        p_limit: 0.70,
-        p_cancel: 0.10,
-        mean_wakeup_interval_ns: 10_000_000,
-        price_offset_lambda: 0.2,
-        default_qty: 1,
+        wake_up_interval_ns: 10_000_000,
+        price_std: 0.000_3,
+        order_size_scale: 1.0,
+        order_size_std: 0.3,
         reference_price: 10_000,
-        tick_size: 1,
         symbol: 0,
     };
     (0..n)
@@ -29,9 +27,11 @@ fn sim_config(duration_ns: u64) -> SimulationConfig {
             default_base_ns: 50_000,
             jitter_mu: 0.0,
             jitter_sigma: 0.3,
+            model: LatencyModelType::Uniform,
         },
         tick_size: 100,
         lot_size: 1,
+        no_market_hours: false,
     }
 }
 

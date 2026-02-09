@@ -11,4 +11,7 @@ pub struct SimulationConfig {
     pub latency: LatencyConfig,
     pub tick_size: i64,
     pub lot_size: u64,
+    /// When `true`, the market is always open (no `MarketOpen` / `MarketClose`
+    /// events are scheduled). Default: `false`.
+    pub no_market_hours: bool,
 }

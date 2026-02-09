@@ -1,107 +1,80 @@
-use std::collections::HashMap;
-
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
-use rand_distr::{Distribution, Exp};
+use rand::Rng;
+use rand::SeedableRng;
+use rand_distr::{Distribution, Normal};
 
 use cda_engine::Side;
 use sim_core::{Agent, AgentAction, AgentId, ExchangeMessage, MarketSnapshot, Nanos, OrderAction};
 
-/// Configuration for a zero-intelligence agent.
+use crate::utils::{IndexedSet, mid_price};
+
+/// Configuration for a zero-intelligence agent (ABIDES-compatible).
 #[derive(Debug, Clone)]
 pub struct ZiAgentConfig {
-    /// Probability of placing a limit order (vs market order).
-    pub p_limit: f64,
-    /// Probability of cancelling a resting order each wakeup.
-    pub p_cancel: f64,
-    /// Mean inter-arrival time between wakeups (nanoseconds).
-    pub mean_wakeup_interval_ns: u64,
-    /// Exponential distribution parameter for limit order price offset (in ticks).
-    pub price_offset_lambda: f64,
-    /// Fixed order quantity.
-    pub default_qty: u64,
+    /// Wakeup interval in nanoseconds (fixed, not exponential).
+    pub wake_up_interval_ns: u64,
+    /// Log-normal price std (relative to mid-price, e.g. 0.0003 = 0.03%).
+    pub price_std: f64,
+    /// Scale for lognormal order size distribution.
+    pub order_size_scale: f64,
+    /// Std for lognormal order size distribution.
+    pub order_size_std: f64,
     /// Reference price when book is empty (internal integer units).
     pub reference_price: i64,
-    /// Minimum price increment.
-    pub tick_size: i64,
     /// Symbol index to trade (0-based).
     pub symbol: u32,
 }
 
-/// Set supporting O(1) insert, remove-by-value, and random-index selection.
-struct IndexedSet {
-    vec: Vec<u64>,
-    map: HashMap<u64, usize>,
-}
-
-impl IndexedSet {
-    fn new() -> Self {
-        Self { vec: Vec::new(), map: HashMap::new() }
-    }
-
-    fn len(&self) -> usize {
-        self.vec.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.vec.is_empty()
-    }
-
-    fn insert(&mut self, val: u64) {
-        let idx = self.vec.len();
-        self.vec.push(val);
-        self.map.insert(val, idx);
-    }
-
-    fn remove(&mut self, val: u64) -> bool {
-        let Some(idx) = self.map.remove(&val) else { return false };
-        self.vec.swap_remove(idx);
-        if idx < self.vec.len() {
-            let swapped = self.vec[idx];
-            self.map.insert(swapped, idx);
-        }
-        true
-    }
-
-    fn remove_at(&mut self, idx: usize) -> u64 {
-        let val = self.vec.swap_remove(idx);
-        self.map.remove(&val);
-        if idx < self.vec.len() {
-            let swapped = self.vec[idx];
-            self.map.insert(swapped, idx);
-        }
-        val
-    }
-}
-
-/// Zero-intelligence constrained (ZI-C) agent.
+/// Zero-intelligence agent matching the ABIDES implementation.
+///
+/// On each wakeup the agent:
+/// 1. Cancels all outstanding orders
+/// 2. Picks a random side (buy/sell 50/50)
+/// 3. Samples order size from a lognormal distribution
+/// 4. Samples price from a lognormal distribution around the mid-price
+/// 5. Places a single limit order
+/// 6. Schedules next wakeup at a fixed interval
 pub struct ZiAgent {
     cfg: ZiAgentConfig,
     rng: SmallRng,
     resting_orders: IndexedSet,
-    offset_dist: Exp<f64>,
-    wakeup_dist: Exp<f64>,
+    price_normal: Normal<f64>,
+    size_normal: Normal<f64>,
 }
 
 impl ZiAgent {
     /// Create a new ZI agent with the given config and RNG seed.
     ///
     /// # Panics
-    /// Panics if `price_offset_lambda` or `mean_wakeup_interval_ns` are invalid.
+    /// Panics if `price_std` produces invalid distribution params.
     #[must_use]
     pub fn new(config: ZiAgentConfig, seed: u64) -> Self {
-        let offset_dist = Exp::new(config.price_offset_lambda)
-            .expect("invalid exponential lambda");
-        #[allow(clippy::cast_precision_loss)]
-        let wakeup_dist = Exp::new(1.0 / config.mean_wakeup_interval_ns as f64)
-            .expect("invalid mean wakeup interval");
+        let log_std = (1.0 + config.price_std).ln();
+        let price_normal = Normal::new(-0.5 * log_std * log_std, log_std)
+            .expect("invalid price distribution params");
+        let size_normal = Normal::new(0.0, config.order_size_std)
+            .expect("invalid order size std");
         Self {
             cfg: config,
             rng: SmallRng::seed_from_u64(seed),
             resting_orders: IndexedSet::new(),
-            offset_dist,
-            wakeup_dist,
+            price_normal,
+            size_normal,
         }
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+    fn sample_price(&mut self, mid: i64) -> i64 {
+        let log_return: f64 = self.price_normal.sample(&mut self.rng);
+        let price = (mid as f64 * log_return.exp()).round() as i64;
+        price.max(1)
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn sample_order_size(&mut self) -> u64 {
+        let normal: f64 = self.size_normal.sample(&mut self.rng);
+        let amount = (normal.exp() * self.cfg.order_size_scale).round() as u64;
+        amount.max(1)
     }
 }
 
@@ -115,40 +88,31 @@ impl Agent for ZiAgent {
     ) {
         let snap = &snapshots[self.cfg.symbol as usize];
 
-        // Maybe cancel a resting order
-        if !self.resting_orders.is_empty() && self.rng.gen::<f64>() < self.cfg.p_cancel {
-            let idx = self.rng.gen_range(0..self.resting_orders.len());
-            let oid = self.resting_orders.remove_at(idx);
+        // Cancel all outstanding orders
+        for oid in self.resting_orders.drain_all() {
             actions.push(AgentAction::CancelOrder {
                 symbol: self.cfg.symbol,
                 order_id: oid,
             });
         }
 
-        // Decide side
+        // Pick random side
         let side = if self.rng.gen::<bool>() { Side::Bid } else { Side::Ask };
 
-        // Decide limit vs market
-        let order = if self.rng.gen::<f64>() < self.cfg.p_limit {
-            let mid = mid_price(snap, self.cfg.reference_price);
-            let offset = self.sample_offset();
-            let price = match side {
-                Side::Bid => (mid - offset).max(self.cfg.tick_size),
-                Side::Ask => mid + offset,
-            };
-            OrderAction::NewLimitOrder { side, price, qty: self.cfg.default_qty }
-        } else {
-            OrderAction::NewMarketOrder { side, qty: self.cfg.default_qty }
-        };
+        // Sample order size and price
+        let mid = mid_price(snap, self.cfg.reference_price);
+        let qty = self.sample_order_size();
+        let price = self.sample_price(mid);
 
         actions.push(AgentAction::SubmitOrder {
             symbol: self.cfg.symbol,
-            order,
+            order: OrderAction::NewLimitOrder { side, price, qty },
         });
 
-        // Schedule next wakeup (exponential inter-arrival)
-        let delay = self.sample_wakeup_delay();
-        actions.push(AgentAction::ScheduleWakeUp { delay_ns: delay });
+        // Schedule next wakeup (fixed interval)
+        actions.push(AgentAction::ScheduleWakeUp {
+            delay_ns: self.cfg.wake_up_interval_ns,
+        });
     }
 
     fn on_exchange_message(
@@ -167,29 +131,5 @@ impl Agent for ZiAgent {
             }
             ExchangeMessage::OrderRejected { .. } => {}
         }
-    }
-}
-
-impl ZiAgent {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
-    fn sample_offset(&mut self) -> i64 {
-        let raw: f64 = self.offset_dist.sample(&mut self.rng);
-        let ticks = (raw / self.cfg.tick_size as f64).round() as i64;
-        ticks.max(1) * self.cfg.tick_size
-    }
-
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn sample_wakeup_delay(&mut self) -> u64 {
-        let delay: f64 = self.wakeup_dist.sample(&mut self.rng);
-        (delay.round() as u64).max(1)
-    }
-}
-
-fn mid_price(snap: &MarketSnapshot, reference: i64) -> i64 {
-    match (snap.best_bid, snap.best_ask) {
-        (Some((bid, _)), Some((ask, _))) => bid + (ask - bid) / 2,
-        (Some((bid, _)), None) => bid,
-        (None, Some((ask, _))) => ask,
-        (None, None) => reference,
     }
 }

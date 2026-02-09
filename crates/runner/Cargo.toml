@@ -12,3 +12,7 @@ cda-engine = { workspace = true }
 [[bin]]
 name = "zi_single_symbol"
 path = "../../sims/zi_single_symbol.rs"
+
+[[bin]]
+name = "four_agents"
+path = "../../sims/four_agents.rs"

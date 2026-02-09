@@ -1,18 +1,19 @@
-use agents::{ZiAgent, ZiAgentConfig};
+use agents::{
+    MarketMakerAgent, MarketMakerConfig, TrendFollowingAgent, TrendFollowingConfig, ZiAgent,
+    ZiAgentConfig,
+};
 use sim_core::{
-    Agent, AgentAction, AgentId, ExchangeMessage, Kernel, LatencyConfig,
+    Agent, AgentAction, AgentId, ExchangeMessage, Kernel, LatencyConfig, LatencyModelType,
     MarketSnapshot, Nanos, OrderAction, SimulationConfig,
 };
 
 fn zi_config() -> ZiAgentConfig {
     ZiAgentConfig {
-        p_limit: 0.70,
-        p_cancel: 0.10,
-        mean_wakeup_interval_ns: 1_000_000,
-        price_offset_lambda: 0.2,
-        default_qty: 1,
+        wake_up_interval_ns: 1_000_000,
+        price_std: 0.000_3,
+        order_size_scale: 1.0,
+        order_size_std: 0.3,
         reference_price: 10_000,
-        tick_size: 1,
         symbol: 0,
     }
 }
@@ -27,9 +28,11 @@ fn sim_config(seed: u64, duration_ns: u64) -> SimulationConfig {
             default_base_ns: 1_000,
             jitter_mu: 0.0,
             jitter_sigma: 0.0001, // near-zero jitter for predictability
+            model: LatencyModelType::Uniform,
         },
         tick_size: 100,
         lot_size: 1,
+        no_market_hours: false,
     }
 }
 
@@ -178,9 +181,11 @@ fn latency_model_base_only() {
             default_base_ns: 1_000_000,     // 1ms
             jitter_mu: 0.0,
             jitter_sigma: 0.0001,
+            model: LatencyModelType::Uniform,
         },
         tick_size: 100,
         lot_size: 1,
+        no_market_hours: false,
     };
     let agents: Vec<Box<dyn Agent>> = vec![
         Box::new(LimitOnlyAgent { side: cda_engine::Side::Bid, price: 100 }),
@@ -232,9 +237,11 @@ fn large_simulation_completes() {
             default_base_ns: 50_000,
             jitter_mu: 0.0,
             jitter_sigma: 0.3,
+            model: LatencyModelType::Uniform,
         },
         tick_size: 100,
         lot_size: 1,
+        no_market_hours: false,
     };
     let agents = make_zi_agents(100, 42);
     let result = Kernel::run(&cfg, agents);
@@ -249,4 +256,146 @@ fn l1_snapshots_recorded() {
     let cfg = sim_config(42, 50_000_000);
     let result = Kernel::run(&cfg, make_zi_agents(20, 42));
     assert!(!result.l1_snapshots.is_empty(), "should record BBO changes");
+}
+
+// ── no_market_hours mode ─────────────────────────────────────────────
+
+#[test]
+fn no_market_hours_allows_trading() {
+    let mut cfg = sim_config(42, 10_000_000);
+    cfg.no_market_hours = true;
+    let result = Kernel::run(&cfg, make_zi_agents(10, 42));
+    assert!(!result.trades.is_empty(), "continuous mode should produce trades");
+}
+
+// ── Trend-following agent ────────────────────────────────────────────
+
+#[test]
+fn trend_following_agent_runs() {
+    let cfg = sim_config(42, 200_000_000);
+    let mut agents: Vec<Box<dyn Agent>> = make_zi_agents(10, 42);
+    agents.push(Box::new(TrendFollowingAgent::new(
+        TrendFollowingConfig {
+            short_window: 3,
+            long_window: 10,
+            threshold: 0.001,
+            price_offset: 0.02,
+            order_size_factor: 1.0,
+            order_size_boost: 1.0,
+            mean_wakeup_interval_ns: 5_000_000,
+            sampling_freq_ns: 2_000_000,
+            reference_price: 10_000,
+            symbol: 0,
+            contrarian: false,
+        },
+        99,
+    )));
+    let result = Kernel::run(&cfg, agents);
+    assert!(result.events_processed > 0);
+    assert!(!result.trades.is_empty());
+}
+
+// ── Contrarian agent ─────────────────────────────────────────────────
+
+#[test]
+fn contrarian_agent_runs() {
+    let cfg = sim_config(42, 200_000_000);
+    let mut agents: Vec<Box<dyn Agent>> = make_zi_agents(10, 42);
+    agents.push(Box::new(TrendFollowingAgent::new(
+        TrendFollowingConfig {
+            short_window: 3,
+            long_window: 10,
+            threshold: 0.001,
+            price_offset: 0.025,
+            order_size_factor: 1.0,
+            order_size_boost: 1.0,
+            mean_wakeup_interval_ns: 5_000_000,
+            sampling_freq_ns: 2_000_000,
+            reference_price: 10_000,
+            symbol: 0,
+            contrarian: true,
+        },
+        99,
+    )));
+    let result = Kernel::run(&cfg, agents);
+    assert!(result.events_processed > 0);
+    assert!(!result.trades.is_empty());
+}
+
+// ── Market-maker agent ───────────────────────────────────────────────
+
+#[test]
+fn market_maker_agent_runs() {
+    let cfg = sim_config(42, 200_000_000);
+    let mut agents: Vec<Box<dyn Agent>> = make_zi_agents(10, 42);
+    agents.push(Box::new(MarketMakerAgent::new(
+        MarketMakerConfig {
+            total_liquidity: 10.0,
+            step_size_ratio: 0.001,
+            max_levels: 3,
+            imbalance_beta: 1.0,
+            peak_distance_ratio: 0.05,
+            shape_exponent: 1.2,
+            mean_wakeup_interval_ns: 5_000_000,
+            reference_price: 10_000,
+            symbol: 0,
+        },
+        99,
+    )));
+    let result = Kernel::run(&cfg, agents);
+    assert!(result.events_processed > 0);
+    assert!(!result.trades.is_empty());
+}
+
+// ── NYC-Seattle latency model ────────────────────────────────────────
+
+#[test]
+fn nyc_seattle_latency_model_works() {
+    let cfg = SimulationConfig {
+        seed: 42,
+        start_time: 0,
+        end_time: 50_000_000,
+        symbols: vec![0],
+        latency: LatencyConfig {
+            default_base_ns: 50_000,
+            jitter_mu: 0.0,
+            jitter_sigma: 0.3,
+            model: LatencyModelType::NycSeattle { seed: 7 },
+        },
+        tick_size: 100,
+        lot_size: 1,
+        no_market_hours: false,
+    };
+    let result = Kernel::run(&cfg, make_zi_agents(10, 42));
+    assert!(result.events_processed > 0);
+}
+
+// ── Mixed agent simulation ───────────────────────────────────────────
+
+#[test]
+fn mixed_agents_simulation() {
+    let cfg = sim_config(42, 200_000_000);
+    let zi_cfg = zi_config();
+    let mut agents: Vec<Box<dyn Agent>> = (0..5)
+        .map(|i| Box::new(ZiAgent::new(zi_cfg.clone(), 42 + i)) as Box<dyn Agent>)
+        .collect();
+    agents.push(Box::new(TrendFollowingAgent::new(
+        TrendFollowingConfig {
+            short_window: 3, long_window: 10, threshold: 0.001,
+            price_offset: 0.02, order_size_factor: 1.0, order_size_boost: 1.0,
+            mean_wakeup_interval_ns: 5_000_000, sampling_freq_ns: 2_000_000,
+            reference_price: 10_000, symbol: 0, contrarian: false,
+        },
+        100,
+    )));
+    agents.push(Box::new(MarketMakerAgent::new(
+        MarketMakerConfig {
+            total_liquidity: 5.0, step_size_ratio: 0.001, max_levels: 2,
+            imbalance_beta: 1.0, peak_distance_ratio: 0.05, shape_exponent: 1.2,
+            mean_wakeup_interval_ns: 5_000_000, reference_price: 10_000, symbol: 0,
+        },
+        101,
+    )));
+    let result = Kernel::run(&cfg, agents);
+    assert!(!result.trades.is_empty(), "mixed agents should trade");
 }
