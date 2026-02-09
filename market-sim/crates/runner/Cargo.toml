@@ -1,0 +1,14 @@
+[package]
+name = "runner"
+version = "0.1.0"
+edition = "2021"
+description = "Simulation runner, scenarios, and integration tests"
+
+[dependencies]
+sim-core = { path = "../sim-core" }
+agents = { path = "../agents" }
+cda-engine = { workspace = true }
+
+[[bin]]
+name = "zi_single_symbol"
+path = "../../sims/zi_single_symbol.rs"

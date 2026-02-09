@@ -1,3 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/cda-engine"]
+members = ["crates/cda-engine", "crates/sim-core", "crates/agents", "crates/runner"]
+
+[workspace.dependencies]
+cda-engine = { path = "crates/cda-engine" }
+rand = { version = "0.8", features = ["small_rng"] }
+rand_distr = "0.4"

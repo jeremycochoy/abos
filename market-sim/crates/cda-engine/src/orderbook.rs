@@ -1,17 +1,25 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::fills::{Fill, OrderResult, OrderStatus};
 use crate::order::{LimitOrder, MarketOrder, RestingOrder, Side};
 
+/// Orders queued at a single price level, with cached total volume.
+struct PriceLevel {
+    orders: VecDeque<RestingOrder>,
+    total_qty: u64,
+}
+
 /// A continuous double-auction order book with price-time (FIFO) priority.
 ///
-/// Internally uses `BTreeMap<i64, VecDeque<RestingOrder>>` per side and a
-/// `HashMap<u64, (Side, i64)>` for O(1) cancel lookups.
+/// Uses lazy (tombstone) cancellation: cancelled orders remain in the queue
+/// and are skipped during matching. This gives O(1) cancel instead of O(n).
 pub struct OrderBook {
-    bids: BTreeMap<i64, VecDeque<RestingOrder>>,
-    asks: BTreeMap<i64, VecDeque<RestingOrder>>,
-    /// `order_id` → (side, price) for O(1) cancel.
-    orders: HashMap<u64, (Side, i64)>,
+    bids: BTreeMap<i64, PriceLevel>,
+    asks: BTreeMap<i64, PriceLevel>,
+    /// `order_id` → (side, price, `remaining_qty`) for O(1) cancel.
+    orders: HashMap<u64, (Side, i64, u64)>,
+    /// Order IDs that have been cancelled but not yet removed from queues.
+    cancelled: HashSet<u64>,
     /// Reusable fill buffer to avoid per-call allocation.
     fill_buf: Vec<Fill>,
 }
@@ -24,6 +32,7 @@ impl OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             orders: HashMap::new(),
+            cancelled: HashSet::new(),
             fill_buf: Vec::new(),
         }
     }
@@ -88,22 +97,24 @@ impl OrderBook {
     }
 
     /// Cancel a resting order by ID. Returns `true` if the order was found and removed.
-    ///
-    /// # Panics
-    /// Panics if internal invariants are violated (order tracked but price level missing).
     pub fn cancel_order(&mut self, order_id: u64) -> bool {
-        let Some((side, price)) = self.orders.remove(&order_id) else {
+        let Some((side, price, remaining_qty)) = self.orders.remove(&order_id) else {
             return false;
         };
+        // Update cached volume at the price level
         let book_side = match side {
             Side::Bid => &mut self.bids,
             Side::Ask => &mut self.asks,
         };
-        let queue = book_side.get_mut(&price).expect("price level must exist for tracked order");
-        queue.retain(|o| o.id != order_id);
-        if queue.is_empty() {
-            book_side.remove(&price);
+        if let Some(level) = book_side.get_mut(&price) {
+            level.total_qty -= remaining_qty;
+            // If no volume left, eagerly remove the level
+            if level.total_qty == 0 {
+                book_side.remove(&price);
+            }
         }
+        // Mark as tombstone; the queue entry will be skipped during matching
+        self.cancelled.insert(order_id);
         true
     }
 
@@ -132,9 +143,7 @@ impl OrderBook {
             Side::Bid => &self.bids,
             Side::Ask => &self.asks,
         };
-        book_side
-            .get(&price)
-            .map_or(0, |q| q.iter().map(|o| o.qty).sum())
+        book_side.get(&price).map_or(0, |level| level.total_qty)
     }
 
     /// Total number of resting orders on the book.
@@ -167,6 +176,16 @@ impl OrderBook {
         }
     }
 
+    /// Pop cancelled tombstones from the front of a price level's queue.
+    fn drain_tombstones(level: &mut PriceLevel, cancelled: &mut HashSet<u64>) {
+        while let Some(front) = level.orders.front() {
+            if !cancelled.remove(&front.id) {
+                break;
+            }
+            level.orders.pop_front();
+        }
+    }
+
     /// Drain the front of the queue at `price` on the *opposite* side of `taker_side`,
     /// filling as much of `remaining` as possible. Removes the price level if fully consumed.
     fn fill_at_level(&mut self, taker_side: Side, taker_id: u64, price: i64, remaining: &mut u64) {
@@ -174,10 +193,12 @@ impl OrderBook {
             Side::Bid => &mut self.asks,
             Side::Ask => &mut self.bids,
         };
-        let queue = book_side.get_mut(&price).expect("price level must exist");
+        let level = book_side.get_mut(&price).expect("price level must exist");
+
+        Self::drain_tombstones(level, &mut self.cancelled);
 
         while *remaining > 0 {
-            let Some(front) = queue.front_mut() else { break };
+            let Some(front) = level.orders.front_mut() else { break };
             let fill_qty = (*remaining).min(front.qty);
 
             self.fill_buf.push(Fill {
@@ -190,27 +211,38 @@ impl OrderBook {
 
             *remaining -= fill_qty;
             front.qty -= fill_qty;
+            level.total_qty -= fill_qty;
 
             if front.qty == 0 {
                 let filled_id = front.id;
-                queue.pop_front();
+                level.orders.pop_front();
                 self.orders.remove(&filled_id);
+                // Update remaining_qty for partial fills tracked in orders map
+            } else if let Some(entry) = self.orders.get_mut(&front.id) {
+                entry.2 -= fill_qty;
             }
+
+            Self::drain_tombstones(level, &mut self.cancelled);
         }
 
-        if queue.is_empty() {
+        if level.orders.is_empty() {
             book_side.remove(&price);
         }
     }
 
     /// Insert a resting order into the appropriate side and register it in the lookup map.
     fn place_resting(&mut self, side: Side, price: i64, order: RestingOrder) {
-        self.orders.insert(order.id, (side, price));
+        self.orders.insert(order.id, (side, price, order.qty));
         let book_side = match side {
             Side::Bid => &mut self.bids,
             Side::Ask => &mut self.asks,
         };
-        book_side.entry(price).or_default().push_back(order);
+        let level = book_side.entry(price).or_insert_with(|| PriceLevel {
+            orders: VecDeque::new(),
+            total_qty: 0,
+        });
+        level.total_qty += order.qty;
+        level.orders.push_back(order);
     }
 }
 
