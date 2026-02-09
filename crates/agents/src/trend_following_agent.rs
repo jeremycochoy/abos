@@ -20,9 +20,9 @@ pub struct TrendFollowingConfig {
     pub threshold: f64,
     /// Price offset from mid as fraction (e.g. 0.02 = 2%).
     pub price_offset: f64,
-    /// Order size factor (multiplied by `|ma_diff|`).
+    /// Order size factor (multiplied by `|ln(short_ma/long_ma)|`).
     pub order_size_factor: f64,
-    /// Order size boost (added to factor*diff).
+    /// Order size boost (added to factor * `log_diff`).
     pub order_size_boost: f64,
     /// Mean inter-arrival time for Poisson wakeups (nanoseconds).
     pub mean_wakeup_interval_ns: u64,
@@ -38,17 +38,19 @@ pub struct TrendFollowingConfig {
 
 /// Trend-following (or contrarian) agent based on moving-average crossover.
 ///
-/// Collects price candles at `sampling_freq_ns` intervals, computes short and
-/// long moving averages, and trades when the difference exceeds `threshold`.
+/// Collects raw mid-price candles at `sampling_freq_ns` intervals, computes
+/// short and long moving averages, then uses the log-ratio
+/// `ln(short_ma) - ln(long_ma)` as the signal. Trades when the signal
+/// exceeds `threshold`.
 ///
 /// In contrarian mode, the `should_trade` condition is inverted (trades when
-/// `|ma_diff| < threshold`) and the trade direction is flipped.
+/// `|signal| < threshold`) and the trade direction is flipped.
 pub struct TrendFollowingAgent {
     cfg: TrendFollowingConfig,
     rng: SmallRng,
     resting_orders: IndexedSet,
     wakeup_dist: Exp<f64>,
-    /// Price history (log-prices, most recent at back).
+    /// Price history (raw mid-prices as f64, most recent at back).
     price_history: VecDeque<f64>,
     /// Time of last price sample.
     last_sample_time: u64,
@@ -143,8 +145,7 @@ impl Agent for TrendFollowingAgent {
         // Sample price candle if enough time has elapsed
         if time >= self.last_sample_time + self.cfg.sampling_freq_ns || self.price_history.is_empty() {
             #[allow(clippy::cast_precision_loss)]
-            let log_price = (mid as f64).ln();
-            self.price_history.push_back(log_price);
+            self.price_history.push_back(mid as f64);
             self.last_sample_time = time;
             // Keep at most long_window + some buffer
             let max_len = self.cfg.long_window + 10;
@@ -158,7 +159,12 @@ impl Agent for TrendFollowingAgent {
             self.compute_ma(self.cfg.short_window),
             self.compute_ma(self.cfg.long_window),
         ) {
-            let ma_diff = short_ma - long_ma;
+            if short_ma <= 0.0 || long_ma <= 0.0 {
+                let delay = self.sample_wakeup_delay();
+                actions.push(AgentAction::ScheduleWakeUp { delay_ns: delay });
+                return;
+            }
+            let ma_diff = short_ma.ln() - long_ma.ln();
 
             if self.should_trade(ma_diff) {
                 // Cancel all outstanding orders
@@ -233,22 +239,68 @@ mod tests {
         }]
     }
 
+    // ── Raw prices stored (not log-prices) ────────────────────────
+
+    #[test]
+    fn stores_raw_prices_not_log() {
+        // Regression: previously stored ln(mid), now stores raw mid.
+        let mut agent = TrendFollowingAgent::new(default_cfg(), 42);
+        let snaps = snap_at_price(10_000);
+        let mut actions = Vec::new();
+        agent.wakeup_into(0, 0, &snaps, &mut actions);
+        // The stored value should be the raw mid-price (≈10_000), not its log (≈9.21)
+        let stored = agent.price_history.back().unwrap();
+        assert!(
+            *stored > 100.0,
+            "price_history should store raw prices, got {stored} (log would be ~9.2)"
+        );
+    }
+
+    // ── Signal uses log-ratio of MAs ────────────────────────────────
+
+    #[test]
+    fn signal_is_log_ratio_of_raw_mas() {
+        // Regression: signal should be ln(short_ma) - ln(long_ma), not
+        // the difference of log-price averages.
+        // With raw prices [100, 200, 300, 400, 500]:
+        //   short_ma(3) = 400, long_ma(5) = 300
+        //   signal = ln(400) - ln(300) = ln(400/300) ≈ 0.2877
+        let mut cfg = default_cfg();
+        cfg.short_window = 3;
+        cfg.long_window = 5;
+        cfg.threshold = 0.0; // always trade
+        cfg.order_size_factor = 1.0;
+        cfg.order_size_boost = 0.0;
+        let mut agent = TrendFollowingAgent::new(cfg, 42);
+        agent.price_history.push_back(100.0);
+        agent.price_history.push_back(200.0);
+        agent.price_history.push_back(300.0);
+        agent.price_history.push_back(400.0);
+        agent.price_history.push_back(500.0);
+        // The signal (log-ratio) drives order size: factor * |signal| + boost
+        // With factor=1, boost=0: size = round(|ln(400/300)|) = round(0.2877) = 0
+        // So size = max(1, 0) = 1
+        let expected_signal = (400.0_f64 / 300.0).ln();
+        let size = agent.compute_order_size(expected_signal);
+        assert_eq!(size, 1, "order size from log-ratio signal should be 1");
+    }
+
     // ── MA computation ──────────────────────────────────────────────
 
     #[test]
     fn ma_computation_correct() {
         let mut agent = TrendFollowingAgent::new(default_cfg(), 42);
-        // Push 5 known log-prices
-        agent.price_history.push_back(1.0);
-        agent.price_history.push_back(2.0);
-        agent.price_history.push_back(3.0);
-        agent.price_history.push_back(4.0);
-        agent.price_history.push_back(5.0);
+        // Push 5 known raw prices
+        agent.price_history.push_back(100.0);
+        agent.price_history.push_back(200.0);
+        agent.price_history.push_back(300.0);
+        agent.price_history.push_back(400.0);
+        agent.price_history.push_back(500.0);
 
-        let short_ma = agent.compute_ma(3).unwrap(); // avg of [3,4,5] = 4.0
-        let long_ma = agent.compute_ma(5).unwrap(); // avg of [1,2,3,4,5] = 3.0
-        assert!((short_ma - 4.0).abs() < 1e-10, "short MA = {short_ma}");
-        assert!((long_ma - 3.0).abs() < 1e-10, "long MA = {long_ma}");
+        let short_ma = agent.compute_ma(3).unwrap(); // avg of [300,400,500] = 400.0
+        let long_ma = agent.compute_ma(5).unwrap(); // avg of [100..500] = 300.0
+        assert!((short_ma - 400.0).abs() < 1e-10, "short MA = {short_ma}");
+        assert!((long_ma - 300.0).abs() < 1e-10, "long MA = {long_ma}");
     }
 
     #[test]
@@ -320,7 +372,8 @@ mod tests {
     #[test]
     fn order_size_proportional_to_signal() {
         let agent = TrendFollowingAgent::new(default_cfg(), 42);
-        // size = factor * |ma_diff| + boost = 1000 * 0.005 + 100 = 105
+        // size = factor * |log_diff| + boost = 1000 * 0.005 + 100 = 105
+        // log_diff represents ln(short_ma / long_ma)
         let size = agent.compute_order_size(0.005);
         assert_eq!(size, 105);
         // Larger signal → larger order
@@ -396,10 +449,10 @@ mod tests {
         agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 10 });
         agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 20 });
 
-        // Fill history so MAs are available with a clear uptrend
-        agent.price_history.push_back(9.0);
-        agent.price_history.push_back(9.1);
-        agent.price_history.push_back(9.2);
+        // Fill history so MAs are available with a clear uptrend (raw prices)
+        agent.price_history.push_back(9000.0);
+        agent.price_history.push_back(9100.0);
+        agent.price_history.push_back(9200.0);
         agent.last_sample_time = 0;
 
         let snaps = snap_at_price(10_000);

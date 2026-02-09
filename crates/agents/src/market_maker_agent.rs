@@ -1,3 +1,5 @@
+use std::collections::{HashMap, VecDeque};
+
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Exp};
@@ -5,7 +7,7 @@ use rand_distr::{Distribution, Exp};
 use cda_engine::Side;
 use sim_core::{Agent, AgentAction, AgentId, ExchangeMessage, MarketSnapshot, Nanos, OrderAction};
 
-use crate::utils::{IndexedSet, mid_price};
+use crate::utils::IndexedSet;
 
 /// Configuration for a liquidity market-maker agent.
 #[derive(Debug, Clone)]
@@ -33,7 +35,9 @@ pub struct MarketMakerConfig {
 /// Liquidity market-maker agent using a symmetric-hump distribution.
 ///
 /// Places multiple bid and ask orders at different price levels around the
-/// mid-price. Adjusts liquidity distribution based on inventory imbalance.
+/// geometric mid-price `sqrt(bid * ask)`. Adjusts liquidity distribution
+/// based on inventory imbalance, with per-side normalization ensuring each
+/// side receives exactly half the total liquidity budget.
 pub struct MarketMakerAgent {
     cfg: MarketMakerConfig,
     rng: SmallRng,
@@ -41,6 +45,10 @@ pub struct MarketMakerAgent {
     wakeup_dist: Exp<f64>,
     /// Net inventory (positive = long, negative = short).
     inventory: i64,
+    /// Maps `order_id` → `Side` so we know the direction when a fill arrives.
+    order_sides: HashMap<u64, Side>,
+    /// Sides of pending submissions, matched to `OrderAccepted` in FIFO order.
+    pending_sides: VecDeque<Side>,
 }
 
 impl MarketMakerAgent {
@@ -59,6 +67,8 @@ impl MarketMakerAgent {
             resting_orders: IndexedSet::new(),
             wakeup_dist,
             inventory: 0,
+            order_sides: HashMap::new(),
+            pending_sides: VecDeque::new(),
         }
     }
 
@@ -86,6 +96,20 @@ impl MarketMakerAgent {
         let delay: f64 = self.wakeup_dist.sample(&mut self.rng);
         (delay.round() as u64).max(1)
     }
+
+    /// Compute mid-price as geometric mean `sqrt(bid * ask)`, matching ABIDES.
+    /// Falls back to one-sided price or reference price when book is empty.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn geometric_mid(snap: &MarketSnapshot, reference: i64) -> i64 {
+        match (snap.best_bid, snap.best_ask) {
+            (Some((bid, _)), Some((ask, _))) => {
+                ((bid as f64 * ask as f64).sqrt().round()) as i64
+            }
+            (Some((bid, _)), None) => bid,
+            (None, Some((ask, _))) => ask,
+            (None, None) => reference,
+        }
+    }
 }
 
 impl Agent for MarketMakerAgent {
@@ -98,10 +122,11 @@ impl Agent for MarketMakerAgent {
         actions: &mut Vec<AgentAction>,
     ) {
         let snap = &snapshots[self.cfg.symbol as usize];
-        let mid = mid_price(snap, self.cfg.reference_price);
+        let mid = Self::geometric_mid(snap, self.cfg.reference_price);
 
         // Cancel all outstanding orders
         for oid in self.resting_orders.drain_all() {
+            self.order_sides.remove(&oid);
             actions.push(AgentAction::CancelOrder {
                 symbol: self.cfg.symbol,
                 order_id: oid,
@@ -111,10 +136,9 @@ impl Agent for MarketMakerAgent {
         let imbalance = self.imbalance();
         let log_step = (1.0 + self.cfg.step_size_ratio).ln();
 
-        // Compute weights for all levels to normalize
+        // Compute weights for all levels
         let mut bid_weights = Vec::with_capacity(self.cfg.max_levels);
         let mut ask_weights = Vec::with_capacity(self.cfg.max_levels);
-        let mut total_weight = 0.0;
 
         for level in 1..=self.cfg.max_levels {
             let log_dist = log_step * level as f64;
@@ -123,37 +147,40 @@ impl Agent for MarketMakerAgent {
             let ask_w = base * (1.0 + imbalance);
             bid_weights.push((log_dist, bid_w));
             ask_weights.push((log_dist, ask_w));
-            total_weight += bid_w + ask_w;
         }
 
-        if total_weight < 1e-15 {
-            actions.push(AgentAction::ScheduleWakeUp {
-                delay_ns: self.sample_wakeup_delay(),
-            });
-            return;
-        }
+        // Per-side normalization: each side gets exactly half the total liquidity
+        let half_liq = self.cfg.total_liquidity * 0.5;
+        let bid_total: f64 = bid_weights.iter().map(|(_, w)| w).sum();
+        let ask_total: f64 = ask_weights.iter().map(|(_, w)| w).sum();
 
         // Place bid orders
-        for &(log_dist, weight) in &bid_weights {
-            let qty = (self.cfg.total_liquidity * weight / total_weight).round() as u64;
-            if qty == 0 { continue; }
-            let price = (mid as f64 * (-log_dist).exp()).round() as i64;
-            if price < 1 { continue; }
-            actions.push(AgentAction::SubmitOrder {
-                symbol: self.cfg.symbol,
-                order: OrderAction::NewLimitOrder { side: Side::Bid, price, qty },
-            });
+        if bid_total > 1e-15 {
+            for &(log_dist, weight) in &bid_weights {
+                let qty = (half_liq * weight / bid_total).round() as u64;
+                if qty == 0 { continue; }
+                let price = (mid as f64 * (-log_dist).exp()).round() as i64;
+                if price < 1 { continue; }
+                self.pending_sides.push_back(Side::Bid);
+                actions.push(AgentAction::SubmitOrder {
+                    symbol: self.cfg.symbol,
+                    order: OrderAction::NewLimitOrder { side: Side::Bid, price, qty },
+                });
+            }
         }
 
         // Place ask orders
-        for &(log_dist, weight) in &ask_weights {
-            let qty = (self.cfg.total_liquidity * weight / total_weight).round() as u64;
-            if qty == 0 { continue; }
-            let price = (mid as f64 * log_dist.exp()).round() as i64;
-            actions.push(AgentAction::SubmitOrder {
-                symbol: self.cfg.symbol,
-                order: OrderAction::NewLimitOrder { side: Side::Ask, price, qty },
-            });
+        if ask_total > 1e-15 {
+            for &(log_dist, weight) in &ask_weights {
+                let qty = (half_liq * weight / ask_total).round() as u64;
+                if qty == 0 { continue; }
+                let price = (mid as f64 * log_dist.exp()).round() as i64;
+                self.pending_sides.push_back(Side::Ask);
+                actions.push(AgentAction::SubmitOrder {
+                    symbol: self.cfg.symbol,
+                    order: OrderAction::NewLimitOrder { side: Side::Ask, price, qty },
+                });
+            }
         }
 
         // Schedule next wakeup
@@ -171,16 +198,26 @@ impl Agent for MarketMakerAgent {
         match message {
             ExchangeMessage::OrderAccepted { order_id } => {
                 self.resting_orders.insert(order_id);
+                if let Some(side) = self.pending_sides.pop_front() {
+                    self.order_sides.insert(order_id, side);
+                }
             }
             ExchangeMessage::OrderFilled { order_id, qty, .. } => {
                 self.resting_orders.remove(order_id);
-                // Track inventory changes (approximate: we don't know side here,
-                // but fills alternate our exposure). We track net fills.
+                // Update inventory based on the side of the filled order:
+                // bid fill → bought → inventory increases
+                // ask fill → sold → inventory decreases
                 #[allow(clippy::cast_possible_wrap)]
-                { self.inventory += qty as i64; }
+                if let Some(side) = self.order_sides.remove(&order_id) {
+                    match side {
+                        Side::Bid => self.inventory += qty as i64,
+                        Side::Ask => self.inventory -= qty as i64,
+                    }
+                }
             }
             ExchangeMessage::OrderCancelled { order_id } => {
                 self.resting_orders.remove(order_id);
+                self.order_sides.remove(&order_id);
             }
             ExchangeMessage::OrderRejected { .. } => {}
         }
@@ -430,25 +467,19 @@ mod tests {
         );
     }
 
-    // ── Inventory imbalance shifts liquidity ────────────────────────
+    // ── Per-side normalization ─────────────────────────────────────
 
     #[test]
-    fn positive_inventory_reduces_bid_increases_ask() {
-        // When long (positive inventory), imbalance > 0, so:
-        //   bid_w = base * (1 - imbalance) → reduced
-        //   ask_w = base * (1 + imbalance) → increased
+    fn per_side_normalization_balances_sides() {
+        // With per-side normalization (matching ABIDES), each side should get
+        // approximately half the total liquidity, even with inventory imbalance.
         let cfg = default_cfg();
-        let mut agent_neutral = MarketMakerAgent::new(cfg.clone(), 42);
-        let mut agent_long = MarketMakerAgent::new(cfg, 42);
-        agent_long.inventory = 200; // strongly long
+        let mut agent = MarketMakerAgent::new(cfg, 42);
+        agent.inventory = 200; // strongly long
 
         let snaps = snap_at_price(10_000);
-
-        let mut actions_neutral = Vec::new();
-        agent_neutral.wakeup_into(0, 0, &snaps, &mut actions_neutral);
-
-        let mut actions_long = Vec::new();
-        agent_long.wakeup_into(0, 0, &snaps, &mut actions_long);
+        let mut actions = Vec::new();
+        agent.wakeup_into(0, 0, &snaps, &mut actions);
 
         let sum_qty = |actions: &[AgentAction], side: Side| -> u64 {
             actions
@@ -462,47 +493,113 @@ mod tests {
                 .sum()
         };
 
-        let neutral_bid = sum_qty(&actions_neutral, Side::Bid);
-        let neutral_ask = sum_qty(&actions_neutral, Side::Ask);
-        let long_bid = sum_qty(&actions_long, Side::Bid);
-        let long_ask = sum_qty(&actions_long, Side::Ask);
+        let bid_qty = sum_qty(&actions, Side::Bid);
+        let ask_qty = sum_qty(&actions, Side::Ask);
+        let half = default_cfg().total_liquidity * 0.5;
 
-        // Neutral should be roughly symmetric
+        // Each side should be approximately half, regardless of imbalance
         assert!(
-            (neutral_bid as f64 - neutral_ask as f64).abs() / ((neutral_bid + neutral_ask) as f64) < 0.01,
-            "neutral agent should have symmetric bid/ask: bid={neutral_bid} ask={neutral_ask}"
-        );
-
-        // Long agent should shift: less bid, more ask
-        assert!(
-            long_bid < neutral_bid,
-            "long inventory should reduce bids: {long_bid} vs neutral {neutral_bid}"
+            (bid_qty as f64 - half).abs() / half < 0.15,
+            "bid qty {bid_qty} should be near half budget {half}"
         );
         assert!(
-            long_ask > neutral_ask,
-            "long inventory should increase asks: {long_ask} vs neutral {neutral_ask}"
+            (ask_qty as f64 - half).abs() / half < 0.15,
+            "ask qty {ask_qty} should be near half budget {half}"
         );
     }
 
-    // ── Fill tracking updates inventory ─────────────────────────────
+    // ── Geometric mid-price ─────────────────────────────────────────
 
     #[test]
-    fn fills_update_inventory() {
+    #[allow(clippy::cast_possible_truncation)]
+    fn geometric_mid_price_used() {
+        // geometric mean of 9000 and 11000 = sqrt(9000*11000) ≈ 9949
+        // arithmetic mean would be 10000
+        let snap = MarketSnapshot {
+            best_bid: Some((9000, 100)),
+            best_ask: Some((11000, 100)),
+            last_trade_price: Some(10000),
+            last_trade_time: Some(0),
+        };
+        let mid = MarketMakerAgent::geometric_mid(&snap, 10_000);
+        let expected = (9000.0_f64 * 11000.0).sqrt().round() as i64;
+        assert_eq!(mid, expected, "should use geometric mean");
+        assert_ne!(mid, 10000, "should differ from arithmetic mean");
+    }
+
+    #[test]
+    fn geometric_mid_fallback_on_empty_book() {
+        let snap = MarketSnapshot {
+            best_bid: None,
+            best_ask: None,
+            last_trade_price: None,
+            last_trade_time: None,
+        };
+        let mid = MarketMakerAgent::geometric_mid(&snap, 10_000);
+        assert_eq!(mid, 10_000, "should fall back to reference price");
+    }
+
+    // ── Fill tracking updates inventory by side ─────────────────────
+
+    #[test]
+    fn bid_fill_increases_inventory() {
         let mut agent = MarketMakerAgent::new(default_cfg(), 42);
         assert_eq!(agent.inventory, 0);
 
+        // Register a bid order's side
+        agent.pending_sides.push_back(Side::Bid);
         agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 1 });
         agent.on_exchange_message(
             0, 0,
             ExchangeMessage::OrderFilled { order_id: 1, price: 100, qty: 10 },
         );
-        assert_eq!(agent.inventory, 10);
+        assert_eq!(agent.inventory, 10, "bid fill should increase inventory");
+    }
 
+    #[test]
+    fn ask_fill_decreases_inventory() {
+        let mut agent = MarketMakerAgent::new(default_cfg(), 42);
+        assert_eq!(agent.inventory, 0);
+
+        // Register an ask order's side
+        agent.pending_sides.push_back(Side::Ask);
+        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 1 });
+        agent.on_exchange_message(
+            0, 0,
+            ExchangeMessage::OrderFilled { order_id: 1, price: 100, qty: 10 },
+        );
+        assert_eq!(agent.inventory, -10, "ask fill should decrease inventory");
+    }
+
+    #[test]
+    fn mixed_fills_track_net_inventory() {
+        let mut agent = MarketMakerAgent::new(default_cfg(), 42);
+
+        // Buy 10, sell 7 → net +3
+        agent.pending_sides.push_back(Side::Bid);
+        agent.pending_sides.push_back(Side::Ask);
+        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 1 });
         agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 2 });
         agent.on_exchange_message(
             0, 0,
-            ExchangeMessage::OrderFilled { order_id: 2, price: 101, qty: 5 },
+            ExchangeMessage::OrderFilled { order_id: 1, price: 100, qty: 10 },
         );
-        assert_eq!(agent.inventory, 15);
+        agent.on_exchange_message(
+            0, 0,
+            ExchangeMessage::OrderFilled { order_id: 2, price: 101, qty: 7 },
+        );
+        assert_eq!(agent.inventory, 3, "net inventory should be +10 - 7 = +3");
+    }
+
+    #[test]
+    fn unknown_fill_does_not_change_inventory() {
+        // If we receive a fill for an order we don't have side info for,
+        // inventory should not change (defensive behavior).
+        let mut agent = MarketMakerAgent::new(default_cfg(), 42);
+        agent.on_exchange_message(
+            0, 0,
+            ExchangeMessage::OrderFilled { order_id: 999, price: 100, qty: 10 },
+        );
+        assert_eq!(agent.inventory, 0, "unknown fill should not change inventory");
     }
 }

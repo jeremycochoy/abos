@@ -3,7 +3,7 @@
 ## Commands
 
 ```bash
-cargo test                    # run all tests (87 tests across 7 test files)
+cargo test                    # run all tests (94 tests across 7 test files)
 cargo clippy --all-targets    # lint check — must pass with zero warnings
 cargo bench                   # run criterion benchmarks
 
@@ -72,6 +72,7 @@ Cargo workspace with four crates under `crates/`, simulation scenarios under `si
 - No `unwrap()` in library code. `debug_assert!` for invariants, `expect()` only for internal invariants that indicate bugs.
 - `cda-engine`: no runtime dependencies (std only), no async, no threads, no I/O.
 - `sim-core`: depends on `arrow`/`parquet` for output, `rand` for RNG. No async.
+- Bug fixes must include a regression test that would detect the bug.
 
 ## Type Conventions
 
@@ -130,10 +131,10 @@ Object-safe, zero-allocation design (actions written to borrowed buffer).
 ### cda-engine: correctness.rs (20 tests) + edge_cases.rs (7 tests)
 Matching engine: placement, fills, partial fills, sweeps, FIFO, cancels, BBO, spread, volume.
 
-### agents: unit tests (36 tests)
+### agents: unit tests (43 tests)
 - **ZiAgent** (10 tests): Price distribution center/std matches ABIDES lognormal formula, order size distribution mean/min, cancel-all, exactly one limit order, fixed-interval wakeup, 50/50 side balance, reference price fallback.
-- **TrendFollowingAgent** (12 tests): MA computation correctness, insufficient history, TF buy/sell/threshold, contrarian sell/buy/threshold, order size proportional to signal, price offset, no trade before enough candles, candle sampling frequency, cancel-all before trading.
-- **MarketMakerAgent** (14 tests): Hump weight positivity/peak-decay/symmetry, inventory imbalance (zero/positive/negative/bounded), both-sides placement, correct number of levels, bid below/ask above mid, total qty matches liquidity budget, cancel-all before placing, imbalance shifts liquidity, fill tracking.
+- **TrendFollowingAgent** (14 tests): Raw-price storage regression, log-ratio signal regression, MA computation, insufficient history, TF buy/sell/threshold, contrarian sell/buy/threshold, order size proportional to signal, price offset, no trade before enough candles, candle sampling frequency, cancel-all before trading.
+- **MarketMakerAgent** (19 tests): Hump weight positivity/peak-decay/symmetry, inventory imbalance (zero/positive/negative/bounded), both-sides placement, correct number of levels, bid below/ask above mid, total qty matches budget, cancel-all before placing, per-side normalization balances sides, geometric mid-price/fallback, bid fill increases inventory, ask fill decreases inventory, mixed fills net inventory, unknown fill safety.
 
 ### runner: simulation_correctness.rs (18 tests)
 Determinism, market open/close, no_market_hours mode, empty book, forced trade, latency models (uniform, NYC-Seattle), fill conservation, order ID uniqueness, all agent types individually, mixed-agent simulation.

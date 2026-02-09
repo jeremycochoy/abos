@@ -22,7 +22,7 @@ python scripts/visualize.py l1_snapshots.parquet
 │   ├── cda-engine/       # CDA matching engine (zero deps, ~21M ops/sec)
 │   ├── sim-core/         # Discrete-event kernel, exchange, latency, Parquet output
 │   ├── agents/           # ZI, TrendFollowing, Contrarian, MarketMaker agents
-│   └── runner/           # Simulation binaries & integration tests (87 tests)
+│   └── runner/           # Simulation binaries & integration tests (94 tests)
 ├── sims/                 # Simulation scenarios (zi_single_symbol, four_agents)
 └── scripts/              # Python visualization with 5-min resampling
 ```
@@ -101,7 +101,7 @@ Shows 4 panels: mid-price with bid-ask band, spread, volume, and returns (5-min 
 ## Development
 
 ```bash
-cargo test                    # 87 tests across 7 test files
+cargo test                    # 94 tests across 7 test files
 cargo clippy --all-targets    # must pass with zero warnings
 cargo bench                   # criterion benchmarks
 ```
