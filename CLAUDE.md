@@ -3,7 +3,7 @@
 ## Commands
 
 ```bash
-cargo test                    # run all tests (51 tests across 4 test files)
+cargo test                    # run all tests (87 tests across 7 test files)
 cargo clippy --all-targets    # lint check — must pass with zero warnings
 cargo bench                   # run criterion benchmarks
 
@@ -129,6 +129,11 @@ Object-safe, zero-allocation design (actions written to borrowed buffer).
 
 ### cda-engine: correctness.rs (20 tests) + edge_cases.rs (7 tests)
 Matching engine: placement, fills, partial fills, sweeps, FIFO, cancels, BBO, spread, volume.
+
+### agents: unit tests (36 tests)
+- **ZiAgent** (10 tests): Price distribution center/std matches ABIDES lognormal formula, order size distribution mean/min, cancel-all, exactly one limit order, fixed-interval wakeup, 50/50 side balance, reference price fallback.
+- **TrendFollowingAgent** (12 tests): MA computation correctness, insufficient history, TF buy/sell/threshold, contrarian sell/buy/threshold, order size proportional to signal, price offset, no trade before enough candles, candle sampling frequency, cancel-all before trading.
+- **MarketMakerAgent** (14 tests): Hump weight positivity/peak-decay/symmetry, inventory imbalance (zero/positive/negative/bounded), both-sides placement, correct number of levels, bid below/ask above mid, total qty matches liquidity budget, cancel-all before placing, imbalance shifts liquidity, fill tracking.
 
 ### runner: simulation_correctness.rs (18 tests)
 Determinism, market open/close, no_market_hours mode, empty book, forced trade, latency models (uniform, NYC-Seattle), fill conservation, order ID uniqueness, all agent types individually, mixed-agent simulation.
