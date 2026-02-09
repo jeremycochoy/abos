@@ -1,0 +1,15 @@
+[package]
+name = "cda-engine"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance Continuous Double Auction engine for agent-based market simulation"
+
+[dependencies]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = { version = "0.8", features = ["small_rng"] }
+
+[[bench]]
+name = "orderbook_bench"
+harness = false
