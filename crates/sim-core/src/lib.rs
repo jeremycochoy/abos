@@ -22,4 +22,5 @@ pub use event::{ExchangeMessage, OrderAction};
 pub use exchange::{Exchange, L1Snapshot, TradeRecord};
 pub use kernel::{Kernel, SimulationResult};
 pub use latency::{LatencyConfig, LatencyModel, LatencyModelType};
+pub use output::Candle;
 pub use types::{AgentId, MarketSnapshot, Nanos, Symbol};
