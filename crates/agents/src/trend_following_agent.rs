@@ -1,0 +1,469 @@
+use std::collections::VecDeque;
+
+use rand::rngs::SmallRng;
+use rand::SeedableRng;
+use rand_distr::{Distribution, Exp};
+
+use cda_engine::Side;
+use sim_core::{Agent, AgentAction, AgentId, ExchangeMessage, MarketSnapshot, Nanos, OrderAction};
+
+use crate::utils::{IndexedSet, mid_price};
+
+/// Configuration for a trend-following agent.
+#[derive(Debug, Clone)]
+pub struct TrendFollowingConfig {
+    /// Short moving-average window (in candles).
+    pub short_window: usize,
+    /// Long moving-average window (in candles).
+    pub long_window: usize,
+    /// Log-return threshold to trigger a trade (e.g. 0.0005 = 0.05%).
+    pub threshold: f64,
+    /// Price offset from mid as fraction (e.g. 0.02 = 2%).
+    pub price_offset: f64,
+    /// Order size factor (multiplied by `|ln(short_ma/long_ma)|`).
+    pub order_size_factor: f64,
+    /// Order size boost (added to factor * `log_diff`).
+    pub order_size_boost: f64,
+    /// Mean inter-arrival time for Poisson wakeups (nanoseconds).
+    pub mean_wakeup_interval_ns: u64,
+    /// Sampling frequency for price candles (nanoseconds).
+    pub sampling_freq_ns: u64,
+    /// Reference price when book is empty.
+    pub reference_price: i64,
+    /// Symbol index to trade (0-based).
+    pub symbol: u32,
+    /// If true, invert the trading direction (contrarian/mean-reversion).
+    pub contrarian: bool,
+}
+
+/// Trend-following (or contrarian) agent based on moving-average crossover.
+///
+/// Collects raw mid-price candles at `sampling_freq_ns` intervals, computes
+/// short and long moving averages, then uses the log-ratio
+/// `ln(short_ma) - ln(long_ma)` as the signal. Trades when the signal
+/// exceeds `threshold`.
+///
+/// In contrarian mode, the `should_trade` condition is inverted (trades when
+/// `|signal| < threshold`) and the trade direction is flipped.
+pub struct TrendFollowingAgent {
+    cfg: TrendFollowingConfig,
+    rng: SmallRng,
+    resting_orders: IndexedSet,
+    wakeup_dist: Exp<f64>,
+    /// Price history (raw mid-prices as f64, most recent at back).
+    price_history: VecDeque<f64>,
+    /// Time of last price sample.
+    last_sample_time: u64,
+}
+
+impl TrendFollowingAgent {
+    /// Create a new trend-following agent.
+    ///
+    /// # Panics
+    /// Panics if `mean_wakeup_interval_ns` is 0.
+    #[must_use]
+    pub fn new(config: TrendFollowingConfig, seed: u64) -> Self {
+        #[allow(clippy::cast_precision_loss)]
+        let wakeup_dist = Exp::new(1.0 / config.mean_wakeup_interval_ns as f64)
+            .expect("invalid mean wakeup interval");
+        Self {
+            cfg: config,
+            rng: SmallRng::seed_from_u64(seed),
+            resting_orders: IndexedSet::new(),
+            wakeup_dist,
+            price_history: VecDeque::new(),
+            last_sample_time: 0,
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn compute_ma(&self, window: usize) -> Option<f64> {
+        if self.price_history.len() < window {
+            return None;
+        }
+        let start = self.price_history.len() - window;
+        let sum: f64 = self.price_history.iter().skip(start).sum();
+        Some(sum / window as f64)
+    }
+
+    fn should_trade(&self, ma_diff: f64) -> bool {
+        if self.cfg.contrarian {
+            ma_diff.abs() < self.cfg.threshold
+        } else {
+            ma_diff.abs() > self.cfg.threshold
+        }
+    }
+
+    fn determine_side(&self, ma_diff: f64) -> Side {
+        if self.cfg.contrarian {
+            // Mean reversion: sell when short > long (overpriced), buy when under
+            if ma_diff > 0.0 { Side::Ask } else { Side::Bid }
+        } else {
+            // Trend following: buy when short > long (uptrend)
+            if ma_diff > 0.0 { Side::Bid } else { Side::Ask }
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn compute_order_size(&self, ma_diff: f64) -> u64 {
+        let size = self.cfg.order_size_factor * ma_diff.abs() + self.cfg.order_size_boost;
+        (size.round() as u64).max(1)
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+    fn compute_price(&self, mid: i64, side: Side) -> i64 {
+        match side {
+            Side::Bid => {
+                let p = mid as f64 * (1.0 + self.cfg.price_offset);
+                (p.round() as i64).max(1)
+            }
+            Side::Ask => {
+                let p = mid as f64 * (1.0 - self.cfg.price_offset);
+                (p.round() as i64).max(1)
+            }
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn sample_wakeup_delay(&mut self) -> u64 {
+        let delay: f64 = self.wakeup_dist.sample(&mut self.rng);
+        (delay.round() as u64).max(1)
+    }
+}
+
+impl Agent for TrendFollowingAgent {
+    fn wakeup_into(
+        &mut self,
+        time: Nanos,
+        _agent_id: AgentId,
+        snapshots: &[MarketSnapshot],
+        actions: &mut Vec<AgentAction>,
+    ) {
+        let snap = &snapshots[self.cfg.symbol as usize];
+        let mid = mid_price(snap, self.cfg.reference_price);
+
+        // Sample price candle if enough time has elapsed
+        if time >= self.last_sample_time + self.cfg.sampling_freq_ns || self.price_history.is_empty() {
+            #[allow(clippy::cast_precision_loss)]
+            self.price_history.push_back(mid as f64);
+            self.last_sample_time = time;
+            // Keep at most long_window + some buffer
+            let max_len = self.cfg.long_window + 10;
+            while self.price_history.len() > max_len {
+                self.price_history.pop_front();
+            }
+        }
+
+        // Compute MAs and decide whether to trade
+        if let (Some(short_ma), Some(long_ma)) = (
+            self.compute_ma(self.cfg.short_window),
+            self.compute_ma(self.cfg.long_window),
+        ) {
+            if short_ma <= 0.0 || long_ma <= 0.0 {
+                let delay = self.sample_wakeup_delay();
+                actions.push(AgentAction::ScheduleWakeUp { delay_ns: delay });
+                return;
+            }
+            let ma_diff = short_ma.ln() - long_ma.ln();
+
+            if self.should_trade(ma_diff) {
+                // Cancel all outstanding orders
+                for oid in self.resting_orders.drain_all() {
+                    actions.push(AgentAction::CancelOrder {
+                        symbol: self.cfg.symbol,
+                        order_id: oid,
+                    });
+                }
+
+                let side = self.determine_side(ma_diff);
+                let qty = self.compute_order_size(ma_diff);
+                let price = self.compute_price(mid, side);
+
+                actions.push(AgentAction::SubmitOrder {
+                    symbol: self.cfg.symbol,
+                    order: OrderAction::NewLimitOrder { side, price, qty },
+                });
+            }
+        }
+
+        // Schedule next wakeup (Poisson process)
+        let delay = self.sample_wakeup_delay();
+        actions.push(AgentAction::ScheduleWakeUp { delay_ns: delay });
+    }
+
+    fn on_exchange_message(
+        &mut self,
+        _time: Nanos,
+        _agent_id: AgentId,
+        message: ExchangeMessage,
+    ) {
+        match message {
+            ExchangeMessage::OrderAccepted { order_id } => {
+                self.resting_orders.insert(order_id);
+            }
+            ExchangeMessage::OrderFilled { order_id, .. }
+            | ExchangeMessage::OrderCancelled { order_id } => {
+                self.resting_orders.remove(order_id);
+            }
+            ExchangeMessage::OrderRejected { .. } => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_cfg() -> TrendFollowingConfig {
+        TrendFollowingConfig {
+            short_window: 3,
+            long_window: 5,
+            threshold: 0.001,
+            price_offset: 0.02,
+            order_size_factor: 1000.0,
+            order_size_boost: 100.0,
+            mean_wakeup_interval_ns: 5_000_000_000,
+            sampling_freq_ns: 1_000_000_000,
+            reference_price: 10_000,
+            symbol: 0,
+            contrarian: false,
+        }
+    }
+
+    fn snap_at_price(mid: i64) -> Vec<MarketSnapshot> {
+        vec![MarketSnapshot {
+            best_bid: Some((mid - 1, 100)),
+            best_ask: Some((mid + 1, 100)),
+            last_trade_price: Some(mid),
+            last_trade_time: Some(0),
+        }]
+    }
+
+    // ── Raw prices stored (not log-prices) ────────────────────────
+
+    #[test]
+    fn stores_raw_prices_not_log() {
+        // Regression: previously stored ln(mid), now stores raw mid.
+        let mut agent = TrendFollowingAgent::new(default_cfg(), 42);
+        let snaps = snap_at_price(10_000);
+        let mut actions = Vec::new();
+        agent.wakeup_into(0, 0, &snaps, &mut actions);
+        // The stored value should be the raw mid-price (≈10_000), not its log (≈9.21)
+        let stored = agent.price_history.back().unwrap();
+        assert!(
+            *stored > 100.0,
+            "price_history should store raw prices, got {stored} (log would be ~9.2)"
+        );
+    }
+
+    // ── Signal uses log-ratio of MAs ────────────────────────────────
+
+    #[test]
+    fn signal_is_log_ratio_of_raw_mas() {
+        // Regression: signal should be ln(short_ma) - ln(long_ma), not
+        // the difference of log-price averages.
+        // With raw prices [100, 200, 300, 400, 500]:
+        //   short_ma(3) = 400, long_ma(5) = 300
+        //   signal = ln(400) - ln(300) = ln(400/300) ≈ 0.2877
+        let mut cfg = default_cfg();
+        cfg.short_window = 3;
+        cfg.long_window = 5;
+        cfg.threshold = 0.0; // always trade
+        cfg.order_size_factor = 1.0;
+        cfg.order_size_boost = 0.0;
+        let mut agent = TrendFollowingAgent::new(cfg, 42);
+        agent.price_history.push_back(100.0);
+        agent.price_history.push_back(200.0);
+        agent.price_history.push_back(300.0);
+        agent.price_history.push_back(400.0);
+        agent.price_history.push_back(500.0);
+        // The signal (log-ratio) drives order size: factor * |signal| + boost
+        // With factor=1, boost=0: size = round(|ln(400/300)|) = round(0.2877) = 0
+        // So size = max(1, 0) = 1
+        let expected_signal = (400.0_f64 / 300.0).ln();
+        let size = agent.compute_order_size(expected_signal);
+        assert_eq!(size, 1, "order size from log-ratio signal should be 1");
+    }
+
+    // ── MA computation ──────────────────────────────────────────────
+
+    #[test]
+    fn ma_computation_correct() {
+        let mut agent = TrendFollowingAgent::new(default_cfg(), 42);
+        // Push 5 known raw prices
+        agent.price_history.push_back(100.0);
+        agent.price_history.push_back(200.0);
+        agent.price_history.push_back(300.0);
+        agent.price_history.push_back(400.0);
+        agent.price_history.push_back(500.0);
+
+        let short_ma = agent.compute_ma(3).unwrap(); // avg of [300,400,500] = 400.0
+        let long_ma = agent.compute_ma(5).unwrap(); // avg of [100..500] = 300.0
+        assert!((short_ma - 400.0).abs() < 1e-10, "short MA = {short_ma}");
+        assert!((long_ma - 300.0).abs() < 1e-10, "long MA = {long_ma}");
+    }
+
+    #[test]
+    fn ma_returns_none_with_insufficient_history() {
+        let mut agent = TrendFollowingAgent::new(default_cfg(), 42);
+        agent.price_history.push_back(1.0);
+        agent.price_history.push_back(2.0);
+        assert!(agent.compute_ma(3).is_none());
+        assert!(agent.compute_ma(5).is_none());
+    }
+
+    // ── Trade direction: trend-following ─────────────────────────────
+
+    #[test]
+    fn trend_following_buys_on_uptrend() {
+        let agent = TrendFollowingAgent::new(default_cfg(), 42);
+        // short MA > long MA → uptrend → should buy
+        assert!(agent.should_trade(0.01)); // |0.01| > 0.001 threshold
+        assert_eq!(agent.determine_side(0.01), Side::Bid);
+    }
+
+    #[test]
+    fn trend_following_sells_on_downtrend() {
+        let agent = TrendFollowingAgent::new(default_cfg(), 42);
+        // short MA < long MA → downtrend → should sell
+        assert!(agent.should_trade(-0.01));
+        assert_eq!(agent.determine_side(-0.01), Side::Ask);
+    }
+
+    #[test]
+    fn trend_following_no_trade_below_threshold() {
+        let agent = TrendFollowingAgent::new(default_cfg(), 42);
+        assert!(!agent.should_trade(0.0005)); // |0.0005| < 0.001 threshold
+        assert!(!agent.should_trade(-0.0005));
+    }
+
+    // ── Trade direction: contrarian ─────────────────────────────────
+
+    #[test]
+    fn contrarian_sells_on_uptrend() {
+        let mut cfg = default_cfg();
+        cfg.contrarian = true;
+        let agent = TrendFollowingAgent::new(cfg, 42);
+        // Contrarian: short > long → overpriced → should SELL
+        // should_trade when |diff| < threshold (mean-reversion near equilibrium)
+        assert!(agent.should_trade(0.0005)); // |0.0005| < 0.001
+        assert_eq!(agent.determine_side(0.01), Side::Ask);
+    }
+
+    #[test]
+    fn contrarian_buys_on_downtrend() {
+        let mut cfg = default_cfg();
+        cfg.contrarian = true;
+        let agent = TrendFollowingAgent::new(cfg, 42);
+        assert_eq!(agent.determine_side(-0.01), Side::Bid);
+    }
+
+    #[test]
+    fn contrarian_no_trade_above_threshold() {
+        let mut cfg = default_cfg();
+        cfg.contrarian = true;
+        let agent = TrendFollowingAgent::new(cfg, 42);
+        // Contrarian: trades when |diff| < threshold, so large diff → no trade
+        assert!(!agent.should_trade(0.01)); // |0.01| > 0.001
+    }
+
+    // ── Order size proportional to signal ────────────────────────────
+
+    #[test]
+    fn order_size_proportional_to_signal() {
+        let agent = TrendFollowingAgent::new(default_cfg(), 42);
+        // size = factor * |log_diff| + boost = 1000 * 0.005 + 100 = 105
+        // log_diff represents ln(short_ma / long_ma)
+        let size = agent.compute_order_size(0.005);
+        assert_eq!(size, 105);
+        // Larger signal → larger order
+        let size_big = agent.compute_order_size(0.02);
+        assert_eq!(size_big, 120); // 1000 * 0.02 + 100 = 120
+        assert!(size_big > size);
+    }
+
+    // ── Price offset ────────────────────────────────────────────────
+
+    #[test]
+    fn price_offset_correct() {
+        let agent = TrendFollowingAgent::new(default_cfg(), 42);
+        let mid = 10_000;
+        // Bid: mid * (1 + 0.02) = 10200 (aggressive, above mid to cross)
+        let bid_price = agent.compute_price(mid, Side::Bid);
+        assert_eq!(bid_price, 10_200);
+        // Ask: mid * (1 - 0.02) = 9800 (aggressive, below mid to cross)
+        let ask_price = agent.compute_price(mid, Side::Ask);
+        assert_eq!(ask_price, 9_800);
+    }
+
+    // ── No trade before enough candles ───────────────────────────────
+
+    #[test]
+    fn no_trade_before_enough_history() {
+        let mut agent = TrendFollowingAgent::new(default_cfg(), 42);
+        let snaps = snap_at_price(10_000);
+        // Only 1 candle collected → not enough for either MA
+        let mut actions = Vec::new();
+        agent.wakeup_into(0, 0, &snaps, &mut actions);
+        let submits: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, AgentAction::SubmitOrder { .. }))
+            .collect();
+        assert_eq!(submits.len(), 0, "should not trade with only 1 candle");
+    }
+
+    // ── Candle sampling respects frequency ──────────────────────────
+
+    #[test]
+    fn candle_sampling_respects_frequency() {
+        let mut agent = TrendFollowingAgent::new(default_cfg(), 42);
+        let snaps = snap_at_price(10_000);
+
+        // First wakeup at t=0: samples candle
+        let mut actions = Vec::new();
+        agent.wakeup_into(0, 0, &snaps, &mut actions);
+        assert_eq!(agent.price_history.len(), 1);
+
+        // Wakeup at t=500ms (before sampling_freq_ns=1s): no new candle
+        actions.clear();
+        agent.wakeup_into(500_000_000, 0, &snaps, &mut actions);
+        assert_eq!(agent.price_history.len(), 1);
+
+        // Wakeup at t=1.0s: new candle
+        actions.clear();
+        agent.wakeup_into(1_000_000_000, 0, &snaps, &mut actions);
+        assert_eq!(agent.price_history.len(), 2);
+    }
+
+    // ── Cancel-all before placing ───────────────────────────────────
+
+    #[test]
+    fn cancels_all_resting_before_trading() {
+        let mut cfg = default_cfg();
+        cfg.short_window = 2;
+        cfg.long_window = 3;
+        cfg.threshold = 0.0; // always trade
+        let mut agent = TrendFollowingAgent::new(cfg, 42);
+
+        // Give it resting orders
+        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 10 });
+        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 20 });
+
+        // Fill history so MAs are available with a clear uptrend (raw prices)
+        agent.price_history.push_back(9000.0);
+        agent.price_history.push_back(9100.0);
+        agent.price_history.push_back(9200.0);
+        agent.last_sample_time = 0;
+
+        let snaps = snap_at_price(10_000);
+        let mut actions = Vec::new();
+        // Wakeup far enough in the future to trigger a new candle
+        agent.wakeup_into(2_000_000_000, 0, &snaps, &mut actions);
+
+        let cancels: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, AgentAction::CancelOrder { .. }))
+            .collect();
+        assert_eq!(cancels.len(), 2, "should cancel both resting orders");
+    }
+}

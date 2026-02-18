@@ -1,0 +1,253 @@
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+
+use crate::fills::{Fill, OrderResult, OrderStatus};
+use crate::order::{LimitOrder, MarketOrder, RestingOrder, Side};
+
+/// Orders queued at a single price level, with cached total volume.
+struct PriceLevel {
+    orders: VecDeque<RestingOrder>,
+    total_qty: u64,
+}
+
+/// A continuous double-auction order book with price-time (FIFO) priority.
+///
+/// Uses lazy (tombstone) cancellation: cancelled orders remain in the queue
+/// and are skipped during matching. This gives O(1) cancel instead of O(n).
+pub struct OrderBook {
+    bids: BTreeMap<i64, PriceLevel>,
+    asks: BTreeMap<i64, PriceLevel>,
+    /// `order_id` → (side, price, `remaining_qty`) for O(1) cancel.
+    orders: HashMap<u64, (Side, i64, u64)>,
+    /// Order IDs that have been cancelled but not yet removed from queues.
+    cancelled: HashSet<u64>,
+    /// Reusable fill buffer to avoid per-call allocation.
+    fill_buf: Vec<Fill>,
+}
+
+impl OrderBook {
+    /// Create an empty order book.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+            orders: HashMap::new(),
+            cancelled: HashSet::new(),
+            fill_buf: Vec::new(),
+        }
+    }
+
+    /// Submit a limit order. Returns fills (if crossing) and the order's final status.
+    ///
+    /// # Panics
+    /// Panics in debug mode if `qty == 0` or `price < 0`.
+    pub fn add_limit_order(&mut self, order: LimitOrder) -> OrderResult {
+        debug_assert!(order.qty > 0, "limit order qty must be > 0");
+        debug_assert!(order.price >= 0, "price must be non-negative");
+
+        self.fill_buf.clear();
+        let mut remaining = order.qty;
+
+        match order.side {
+            Side::Bid => self.match_against_asks(order.id, order.price, &mut remaining),
+            Side::Ask => self.match_against_bids(order.id, order.price, &mut remaining),
+        }
+
+        let status = if remaining == 0 {
+            OrderStatus::Filled
+        } else {
+            self.place_resting(order.side, order.price, RestingOrder {
+                id: order.id,
+                qty: remaining,
+                timestamp: order.timestamp,
+            });
+            if remaining == order.qty {
+                OrderStatus::Placed
+            } else {
+                OrderStatus::Resting { remaining_qty: remaining }
+            }
+        };
+
+        OrderResult { fills: self.fill_buf.drain(..).collect(), status }
+    }
+
+    /// Submit a market order. Returns fills. Unfilled remainder is cancelled.
+    ///
+    /// # Panics
+    /// Panics in debug mode if `qty == 0`.
+    pub fn add_market_order(&mut self, order: MarketOrder) -> OrderResult {
+        debug_assert!(order.qty > 0, "market order qty must be > 0");
+
+        self.fill_buf.clear();
+        let mut remaining = order.qty;
+
+        match order.side {
+            Side::Bid => self.match_against_asks(order.id, i64::MAX, &mut remaining),
+            Side::Ask => self.match_against_bids(order.id, 0, &mut remaining),
+        }
+
+        let filled_qty = order.qty - remaining;
+        let status = if remaining == 0 {
+            OrderStatus::Filled
+        } else {
+            OrderStatus::Cancelled { filled_qty }
+        };
+
+        OrderResult { fills: self.fill_buf.drain(..).collect(), status }
+    }
+
+    /// Cancel a resting order by ID. Returns `true` if the order was found and removed.
+    pub fn cancel_order(&mut self, order_id: u64) -> bool {
+        let Some((side, price, remaining_qty)) = self.orders.remove(&order_id) else {
+            return false;
+        };
+        // Update cached volume at the price level
+        let book_side = match side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks,
+        };
+        if let Some(level) = book_side.get_mut(&price) {
+            level.total_qty -= remaining_qty;
+            // If no volume left, eagerly remove the level
+            if level.total_qty == 0 {
+                book_side.remove(&price);
+            }
+        }
+        // Mark as tombstone; the queue entry will be skipped during matching
+        self.cancelled.insert(order_id);
+        true
+    }
+
+    /// Best (highest) bid price, or `None` if the bid side is empty.
+    #[must_use]
+    pub fn best_bid(&self) -> Option<i64> {
+        self.bids.keys().next_back().copied()
+    }
+
+    /// Best (lowest) ask price, or `None` if the ask side is empty.
+    #[must_use]
+    pub fn best_ask(&self) -> Option<i64> {
+        self.asks.keys().next().copied()
+    }
+
+    /// Spread (best ask − best bid), or `None` if either side is empty.
+    #[must_use]
+    pub fn spread(&self) -> Option<i64> {
+        Some(self.best_ask()? - self.best_bid()?)
+    }
+
+    /// Total resting volume at a given price level and side.
+    #[must_use]
+    pub fn volume_at(&self, price: i64, side: Side) -> u64 {
+        let book_side = match side {
+            Side::Bid => &self.bids,
+            Side::Ask => &self.asks,
+        };
+        book_side.get(&price).map_or(0, |level| level.total_qty)
+    }
+
+    /// Total number of resting orders on the book.
+    #[must_use]
+    pub fn order_count(&self) -> usize {
+        self.orders.len()
+    }
+
+    // ── internal matching ──────────────────────────────────────────────
+
+    /// Match an incoming bid against resting asks at prices ≤ `limit_price`.
+    fn match_against_asks(&mut self, taker_id: u64, limit_price: i64, remaining: &mut u64) {
+        while *remaining > 0 {
+            let Some((&ask_price, _)) = self.asks.first_key_value() else { break };
+            if ask_price > limit_price {
+                break;
+            }
+            self.fill_at_level(Side::Bid, taker_id, ask_price, remaining);
+        }
+    }
+
+    /// Match an incoming ask against resting bids at prices ≥ `limit_price`.
+    fn match_against_bids(&mut self, taker_id: u64, limit_price: i64, remaining: &mut u64) {
+        while *remaining > 0 {
+            let Some((&bid_price, _)) = self.bids.last_key_value() else { break };
+            if bid_price < limit_price {
+                break;
+            }
+            self.fill_at_level(Side::Ask, taker_id, bid_price, remaining);
+        }
+    }
+
+    /// Pop cancelled tombstones from the front of a price level's queue.
+    fn drain_tombstones(level: &mut PriceLevel, cancelled: &mut HashSet<u64>) {
+        while let Some(front) = level.orders.front() {
+            if !cancelled.remove(&front.id) {
+                break;
+            }
+            level.orders.pop_front();
+        }
+    }
+
+    /// Drain the front of the queue at `price` on the *opposite* side of `taker_side`,
+    /// filling as much of `remaining` as possible. Removes the price level if fully consumed.
+    fn fill_at_level(&mut self, taker_side: Side, taker_id: u64, price: i64, remaining: &mut u64) {
+        let book_side = match taker_side {
+            Side::Bid => &mut self.asks,
+            Side::Ask => &mut self.bids,
+        };
+        let level = book_side.get_mut(&price).expect("price level must exist");
+
+        Self::drain_tombstones(level, &mut self.cancelled);
+
+        while *remaining > 0 {
+            let Some(front) = level.orders.front_mut() else { break };
+            let fill_qty = (*remaining).min(front.qty);
+
+            self.fill_buf.push(Fill {
+                maker_order_id: front.id,
+                taker_order_id: taker_id,
+                price,
+                qty: fill_qty,
+                taker_side,
+            });
+
+            *remaining -= fill_qty;
+            front.qty -= fill_qty;
+            level.total_qty -= fill_qty;
+
+            if front.qty == 0 {
+                let filled_id = front.id;
+                level.orders.pop_front();
+                self.orders.remove(&filled_id);
+                // Update remaining_qty for partial fills tracked in orders map
+            } else if let Some(entry) = self.orders.get_mut(&front.id) {
+                entry.2 -= fill_qty;
+            }
+
+            Self::drain_tombstones(level, &mut self.cancelled);
+        }
+
+        if level.orders.is_empty() {
+            book_side.remove(&price);
+        }
+    }
+
+    /// Insert a resting order into the appropriate side and register it in the lookup map.
+    fn place_resting(&mut self, side: Side, price: i64, order: RestingOrder) {
+        self.orders.insert(order.id, (side, price, order.qty));
+        let book_side = match side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks,
+        };
+        let level = book_side.entry(price).or_insert_with(|| PriceLevel {
+            orders: VecDeque::new(),
+            total_qty: 0,
+        });
+        level.total_qty += order.qty;
+        level.orders.push_back(order);
+    }
+}
+
+impl Default for OrderBook {
+    fn default() -> Self {
+        Self::new()
+    }
+}

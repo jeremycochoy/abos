@@ -1,0 +1,20 @@
+[package]
+name = "sim-core"
+version = "0.1.0"
+edition = "2021"
+description = "Discrete-event simulation kernel for agent-based market simulation"
+
+[dependencies]
+cda-engine = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+arrow = { version = "53", default-features = false }
+parquet = { version = "53", default-features = false, features = ["arrow"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+agents = { path = "../agents" }
+
+[[bench]]
+name = "simulation_bench"
+harness = false
