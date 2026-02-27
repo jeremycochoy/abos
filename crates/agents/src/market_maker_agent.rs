@@ -10,7 +10,7 @@ use sim_core::{Agent, AgentAction, AgentId, ExchangeMessage, MarketSnapshot, Nan
 use crate::utils::IndexedSet;
 
 /// Configuration for a liquidity market-maker agent.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct MarketMakerConfig {
     /// Total liquidity budget per update cycle (in qty units).
     pub total_liquidity: f64,

@@ -1,8 +1,10 @@
+use serde::Deserialize;
+
 use crate::latency::LatencyConfig;
 use crate::types::Symbol;
 
 /// Top-level simulation configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SimulationConfig {
     pub seed: u64,
     pub start_time: u64,

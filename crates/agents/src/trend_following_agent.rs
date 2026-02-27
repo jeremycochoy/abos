@@ -10,7 +10,7 @@ use sim_core::{Agent, AgentAction, AgentId, ExchangeMessage, MarketSnapshot, Nan
 use crate::utils::{IndexedSet, mid_price};
 
 /// Configuration for a trend-following agent.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct TrendFollowingConfig {
     /// Short moving-average window (in candles).
     pub short_window: usize,

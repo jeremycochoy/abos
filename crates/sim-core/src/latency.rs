@@ -10,7 +10,7 @@ const LIGHT_SPEED_M_PER_NS: f64 = 0.299_792_458;
 const NYC_SEATTLE_METERS: f64 = 3_866_660.0;
 
 /// Configuration for the latency model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct LatencyConfig {
     /// Default one-way base latency in nanoseconds (used when `model` is
     /// `Uniform`).
@@ -24,7 +24,7 @@ pub struct LatencyConfig {
 }
 
 /// Type of latency model.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 pub enum LatencyModelType {
     /// Every agent has the same base latency (the default).
     #[default]

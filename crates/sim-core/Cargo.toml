@@ -8,6 +8,8 @@ description = "Discrete-event simulation kernel for agent-based market simulatio
 cda-engine = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 arrow = { version = "53", default-features = false }
 parquet = { version = "53", default-features = false, features = ["arrow"] }
 

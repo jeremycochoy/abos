@@ -9,3 +9,4 @@ sim-core = { path = "../sim-core" }
 cda-engine = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
+serde = { workspace = true }
