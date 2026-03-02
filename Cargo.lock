@@ -968,7 +968,6 @@ dependencies = [
  "agents",
  "cda-engine",
  "serde",
- "serde_json",
  "sim-core",
 ]
 

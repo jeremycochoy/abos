@@ -9,8 +9,6 @@ sim-core = { path = "../sim-core" }
 agents = { path = "../agents" }
 cda-engine = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
-
 [[bin]]
 name = "zi_single_symbol"
 path = "../../sims/zi_single_symbol.rs"
@@ -18,7 +16,3 @@ path = "../../sims/zi_single_symbol.rs"
 [[bin]]
 name = "four_agents"
 path = "../../sims/four_agents.rs"
-
-[[bin]]
-name = "run_json"
-path = "../../sims/run_json.rs"

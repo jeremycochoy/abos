@@ -1,15 +1,28 @@
 //! Pluggable sampling strategies for agent order placement and wakeup timing.
 //!
-//! Three traits define the sampling interfaces:
-//! - [`PriceSampler`] — how order prices are chosen around the mid-price
-//! - [`OrderSizeSampler`] — how order quantities are determined
-//! - [`WakeupSampler`] — how inter-wakeup delays are drawn
+//! ## ZI agent traits
+//! - [`PriceSampler`] — order prices around mid-price
+//! - [`OrderSizeSampler`] — order quantities
+//! - [`WakeupSampler`] — inter-wakeup delays (shared with all agent types)
+//!
+//! ## Trend-following / contrarian agent traits
+//! - [`TrendPriceSampler`] — side-aware order pricing
+//! - [`TrendSizeSampler`] — signal-proportional order sizing
+//!
+//! ## Market-maker agent traits
+//! - [`LiquidityWeightModel`] — per-level liquidity weight function
 //!
 //! Each trait receives `&mut SmallRng` from the agent, keeping a single RNG
 //! stream per agent for reproducibility.
 
 use rand::rngs::SmallRng;
 use rand_distr::{Distribution, Exp, Normal};
+
+use cda_engine::Side;
+
+// ═══════════════════════════════════════════════════════════════════
+// ZI agent traits
+// ═══════════════════════════════════════════════════════════════════
 
 /// Samples an order price given the current mid-price.
 pub trait PriceSampler {
@@ -21,12 +34,40 @@ pub trait OrderSizeSampler {
     fn sample_order_size(&mut self, rng: &mut SmallRng) -> u64;
 }
 
-/// Samples a wakeup delay in nanoseconds.
+/// Samples a wakeup delay in nanoseconds. Used by all agent types.
 pub trait WakeupSampler {
     fn sample_wakeup_delay(&mut self, rng: &mut SmallRng) -> u64;
 }
 
-// ── Default implementations ─────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// Trend-following / contrarian agent traits
+// ═══════════════════════════════════════════════════════════════════
+
+/// Side-aware price sampler for trend agents.
+/// Given a mid-price and trade side, returns the limit order price.
+pub trait TrendPriceSampler {
+    fn sample_price(&mut self, mid: i64, side: Side, rng: &mut SmallRng) -> i64;
+}
+
+/// Signal-proportional order size sampler for trend agents.
+/// `ma_diff` is `ln(short_ma) - ln(long_ma)`.
+pub trait TrendSizeSampler {
+    fn sample_order_size(&mut self, ma_diff: f64, rng: &mut SmallRng) -> u64;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Market-maker agent traits
+// ═══════════════════════════════════════════════════════════════════
+
+/// Per-level liquidity weight function for market-maker agents.
+/// Returns the unnormalized weight at a given log-distance from mid-price.
+pub trait LiquidityWeightModel {
+    fn weight(&mut self, log_distance: f64, rng: &mut SmallRng) -> f64;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Default implementations — ZI
+// ═══════════════════════════════════════════════════════════════════
 
 /// Log-normal price sampler: `price = mid * exp(N(-σ²/2, σ))` where `σ = ln(1 + price_std)`.
 pub struct LogNormalPriceSampler {
@@ -121,11 +162,93 @@ impl WakeupSampler for PoissonWakeup {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Default implementations — Trend-following
+// ═══════════════════════════════════════════════════════════════════
+
+/// Fixed-offset price sampler for trend agents.
+/// Bid: `mid * (1 + offset)`, Ask: `mid * (1 - offset)`.
+pub struct OffsetPriceSampler {
+    offset: f64,
+}
+
+impl OffsetPriceSampler {
+    #[must_use]
+    pub fn new(offset: f64) -> Self {
+        Self { offset }
+    }
+}
+
+impl TrendPriceSampler for OffsetPriceSampler {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+    fn sample_price(&mut self, mid: i64, side: Side, _rng: &mut SmallRng) -> i64 {
+        match side {
+            Side::Bid => ((mid as f64 * (1.0 + self.offset)).round() as i64).max(1),
+            Side::Ask => ((mid as f64 * (1.0 - self.offset)).round() as i64).max(1),
+        }
+    }
+}
+
+/// Proportional order size sampler for trend agents.
+/// `size = factor * |ma_diff| + boost`, clamped to minimum 1.
+pub struct ProportionalSizeSampler {
+    factor: f64,
+    boost: f64,
+}
+
+impl ProportionalSizeSampler {
+    #[must_use]
+    pub fn new(factor: f64, boost: f64) -> Self {
+        Self { factor, boost }
+    }
+}
+
+impl TrendSizeSampler for ProportionalSizeSampler {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn sample_order_size(&mut self, ma_diff: f64, _rng: &mut SmallRng) -> u64 {
+        ((self.factor * ma_diff.abs() + self.boost).round() as u64).max(1)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Default implementations — Market-maker
+// ═══════════════════════════════════════════════════════════════════
+
+/// Symmetric-hump liquidity weight model.
+/// `w = (d + ε)^exponent * exp(-decay * d)` where
+/// `decay = exponent / (ln(1 + peak_distance_ratio) + ε)`.
+pub struct SymmetricHumpModel {
+    peak_distance_ratio: f64,
+    shape_exponent: f64,
+}
+
+impl SymmetricHumpModel {
+    #[must_use]
+    pub fn new(peak_distance_ratio: f64, shape_exponent: f64) -> Self {
+        Self {
+            peak_distance_ratio,
+            shape_exponent,
+        }
+    }
+}
+
+impl LiquidityWeightModel for SymmetricHumpModel {
+    fn weight(&mut self, log_distance: f64, _rng: &mut SmallRng) -> f64 {
+        let eps = 4e-4;
+        let peak_fraction = (1.0 + self.peak_distance_ratio).ln();
+        let decay_rate = self.shape_exponent / (peak_fraction + eps);
+        let d = log_distance.abs() + eps;
+        d.powf(self.shape_exponent) * (-decay_rate * log_distance.abs()).exp()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::cast_precision_loss, clippy::cast_lossless)]
 mod tests {
     use super::*;
     use rand::SeedableRng;
+
+    // ── ZI sampler tests ────────────────────────────────────────────
 
     #[test]
     fn lognormal_price_centered_on_mid() {
@@ -217,6 +340,77 @@ mod tests {
         assert!(
             (0.9..1.1).contains(&ratio),
             "mean delay {mean:.0} vs expected {mean_ns} (ratio {ratio:.2})"
+        );
+    }
+
+    // ── Trend sampler tests ─────────────────────────────────────────
+
+    #[test]
+    fn offset_price_correct() {
+        let mut sampler = OffsetPriceSampler::new(0.02);
+        let mut rng = SmallRng::seed_from_u64(42);
+        let mid = 10_000;
+        assert_eq!(sampler.sample_price(mid, Side::Bid, &mut rng), 10_200);
+        assert_eq!(sampler.sample_price(mid, Side::Ask, &mut rng), 9_800);
+    }
+
+    #[test]
+    fn proportional_size_correct() {
+        let mut sampler = ProportionalSizeSampler::new(1000.0, 100.0);
+        let mut rng = SmallRng::seed_from_u64(42);
+        // 1000 * 0.005 + 100 = 105
+        assert_eq!(sampler.sample_order_size(0.005, &mut rng), 105);
+        // 1000 * 0.02 + 100 = 120
+        assert_eq!(sampler.sample_order_size(0.02, &mut rng), 120);
+    }
+
+    #[test]
+    fn proportional_size_minimum_one() {
+        let mut sampler = ProportionalSizeSampler::new(1.0, 0.0);
+        let mut rng = SmallRng::seed_from_u64(42);
+        // 1.0 * 0.0001 + 0.0 = 0.0001 → rounds to 0 → clamped to 1
+        assert_eq!(sampler.sample_order_size(0.0001, &mut rng), 1);
+    }
+
+    // ── Market-maker weight model tests ─────────────────────────────
+
+    #[test]
+    fn symmetric_hump_positive_for_nonzero_distance() {
+        let mut model = SymmetricHumpModel::new(0.05, 1.2);
+        let mut rng = SmallRng::seed_from_u64(42);
+        for i in 1..=10 {
+            let d = 0.001 * f64::from(i);
+            let w = model.weight(d, &mut rng);
+            assert!(w > 0.0, "weight({d}) = {w}, expected > 0");
+        }
+    }
+
+    #[test]
+    fn symmetric_hump_peaks_then_decays() {
+        let mut model = SymmetricHumpModel::new(0.05, 1.2);
+        let mut rng = SmallRng::seed_from_u64(42);
+        let near = model.weight(0.001, &mut rng);
+        let mid_d = model.weight(0.05, &mut rng);
+        let far = model.weight(0.5, &mut rng);
+        assert!(
+            mid_d > near,
+            "weight at peak distance ({mid_d:.6}) should exceed weight near zero ({near:.6})"
+        );
+        assert!(
+            mid_d > far,
+            "weight at peak ({mid_d:.6}) should exceed weight far out ({far:.6})"
+        );
+    }
+
+    #[test]
+    fn symmetric_hump_is_symmetric() {
+        let mut model = SymmetricHumpModel::new(0.05, 1.2);
+        let mut rng = SmallRng::seed_from_u64(42);
+        let positive = model.weight(0.02, &mut rng);
+        let negative = model.weight(-0.02, &mut rng);
+        assert!(
+            (positive - negative).abs() < 1e-15,
+            "hump weight should be symmetric: {positive} vs {negative}"
         );
     }
 }
