@@ -28,7 +28,11 @@ pub enum ExchangeMessage {
     /// fills.
     OrderAccepted { order_id: u64, user_id: u64, symbol: Symbol, side: cda_engine::Side, qty: u64 },
     /// One fill of the order. `side` is the order owner's side (for a fill
-    /// of a resting order, that is the resting order's side).
+    /// of a resting order, that is the resting order's side). `remaining` is
+    /// the order's unfilled quantity AFTER this fill: 0 means the order is
+    /// done, a positive value means it is still resting — so an owner can
+    /// maintain its resting-order set from fills alone, without inferring
+    /// lifecycle from message ordering.
     OrderFilled {
         order_id: u64,
         user_id: u64,
@@ -36,6 +40,7 @@ pub enum ExchangeMessage {
         side: cda_engine::Side,
         price: i64,
         qty: u64,
+        remaining: u64,
     },
     OrderCancelled { order_id: u64, user_id: u64, symbol: Symbol },
     /// A rejected NEW order is reported with `order_id` 0 (no id is ever

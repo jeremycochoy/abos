@@ -155,7 +155,6 @@ impl Exchange {
         match action {
             OrderAction::NewLimitOrder { side, price, qty, user_id } => {
                 let order = NewOrder { id: self.alloc_id(), user_id, side, qty };
-                self.push_accepted(agent_id, order, out);
                 let result = self.book.add_limit_order(LimitOrder {
                     id: order.id, side, price, qty, timestamp: time,
                 });
@@ -164,7 +163,6 @@ impl Exchange {
             }
             OrderAction::NewMarketOrder { side, qty, user_id } => {
                 let order = NewOrder { id: self.alloc_id(), user_id, side, qty };
-                self.push_accepted(agent_id, order, out);
                 let result = self.book.add_market_order(MarketOrder { id: order.id, side, qty });
                 self.record_fills(side, &result.fills, time, out);
                 self.notify_taker(agent_id, order, &result, out);
@@ -211,9 +209,12 @@ impl Exchange {
         id
     }
 
-    /// Creation acknowledgment: sent exactly once for every new order —
-    /// including one that fully fills at submission — before any of its
-    /// fills, carrying everything the owner needs to identify it later.
+    /// Creation acknowledgment: sent exactly once for every new order,
+    /// including one that fully fills at submission, carrying everything the
+    /// owner needs to identify the order. Emission order per status
+    /// preserves the legacy sequence the existing agents were built against:
+    /// full fill → ack THEN fill; partial-fill-and-rest → fill THEN ack;
+    /// rest without fill → ack only.
     fn push_accepted(&self, agent_id: AgentId, order: NewOrder, out: &mut Vec<RoutedMessage>) {
         out.push(RoutedMessage {
             agent_id,
@@ -253,6 +254,7 @@ impl Exchange {
             });
 
             if let Some(info) = self.resting.get_mut(&fill.maker_order_id) {
+                info.remaining_qty = info.remaining_qty.saturating_sub(fill.qty);
                 out.push(RoutedMessage {
                     agent_id: info.agent_id,
                     message: ExchangeMessage::OrderFilled {
@@ -262,9 +264,9 @@ impl Exchange {
                         side: maker_side,
                         price: fill.price,
                         qty: fill.qty,
+                        remaining: info.remaining_qty,
                     },
                 });
-                info.remaining_qty = info.remaining_qty.saturating_sub(fill.qty);
                 if info.remaining_qty == 0 {
                     self.resting.remove(&fill.maker_order_id);
                 }
@@ -282,6 +284,7 @@ impl Exchange {
         let last_price = result.fills.last().map_or(0, |f| f.price);
         match result.status {
             OrderStatus::Filled => {
+                self.push_accepted(taker, order, out);
                 let total: u64 = result.fills.iter().map(|f| f.qty).sum();
                 out.push(RoutedMessage {
                     agent_id: taker,
@@ -292,6 +295,7 @@ impl Exchange {
                         side: order.side,
                         price: last_price,
                         qty: total,
+                        remaining: 0,
                     },
                 });
             }
@@ -299,11 +303,15 @@ impl Exchange {
                 self.resting.insert(order.id, OrderInfo {
                     agent_id: taker, remaining_qty: order.qty, user_id: order.user_id,
                 });
+                self.push_accepted(taker, order, out);
             }
             OrderStatus::Resting { remaining_qty } => {
                 self.resting.insert(order.id, OrderInfo {
                     agent_id: taker, remaining_qty, user_id: order.user_id,
                 });
+                // Legacy order: the submission fill precedes the ack, so an
+                // agent that inserts on accept and removes on fill ends up
+                // TRACKING the resting remainder, exactly as before.
                 let filled: u64 = result.fills.iter().map(|f| f.qty).sum();
                 if filled > 0 {
                     out.push(RoutedMessage {
@@ -315,9 +323,11 @@ impl Exchange {
                             side: order.side,
                             price: last_price,
                             qty: filled,
+                            remaining: remaining_qty,
                         },
                     });
                 }
+                self.push_accepted(taker, order, out);
             }
             OrderStatus::Cancelled { filled_qty } => {
                 if filled_qty > 0 {
@@ -330,6 +340,7 @@ impl Exchange {
                             side: order.side,
                             price: last_price,
                             qty: filled_qty,
+                            remaining: order.qty - filled_qty,
                         },
                     });
                 }
@@ -398,10 +409,38 @@ mod tests {
             other => panic!("first taker message must be the creation ack, got {other:?}"),
         }
         match to_taker[1].message {
-            ExchangeMessage::OrderFilled { user_id, symbol, side, qty, .. } => {
-                assert_eq!((user_id, symbol, side, qty), (9, SYM, Side::Bid, 10));
+            ExchangeMessage::OrderFilled { user_id, symbol, side, qty, remaining, .. } => {
+                assert_eq!((user_id, symbol, side, qty, remaining), (9, SYM, Side::Bid, 10, 0));
             }
             other => panic!("second taker message must be the fill, got {other:?}"),
+        }
+    }
+
+    // An order that partially fills at submission and rests keeps the LEGACY
+    // echo order — fill first, then the ack — so an agent that inserts on
+    // accept and removes on fill ends up tracking the resting remainder,
+    // exactly as it did before this protocol change.
+    #[test]
+    fn partial_fill_at_submission_emits_fill_then_ack() {
+        let mut ex = open_exchange();
+        let mut msgs = Vec::new();
+        ex.process_into(0, limit(Side::Ask, 100, 4, 5), 0, &mut msgs);
+        msgs.clear();
+        ex.process_into(1, limit(Side::Bid, 100, 10, 9), 1, &mut msgs);
+
+        let to_taker: Vec<_> = msgs.iter().filter(|m| m.agent_id == 1).collect();
+        assert_eq!(to_taker.len(), 2, "submission fill + creation ack");
+        match to_taker[0].message {
+            ExchangeMessage::OrderFilled { qty, remaining, side, .. } => {
+                assert_eq!((qty, remaining, side), (4, 6, Side::Bid));
+            }
+            other => panic!("first message must be the submission fill, got {other:?}"),
+        }
+        match to_taker[1].message {
+            ExchangeMessage::OrderAccepted { qty, side, .. } => {
+                assert_eq!((qty, side), (10, Side::Bid));
+            }
+            other => panic!("second message must be the creation ack, got {other:?}"),
         }
     }
 
@@ -420,8 +459,8 @@ mod tests {
             .find(|m| m.agent_id == 0)
             .expect("maker must be notified of the fill");
         match maker_fill.message {
-            ExchangeMessage::OrderFilled { user_id, symbol, side, qty, .. } => {
-                assert_eq!((user_id, symbol, side, qty), (5, SYM, Side::Ask, 4));
+            ExchangeMessage::OrderFilled { user_id, symbol, side, qty, remaining, .. } => {
+                assert_eq!((user_id, symbol, side, qty, remaining), (5, SYM, Side::Ask, 4, 6));
             }
             other => panic!("maker must receive a fill, got {other:?}"),
         }

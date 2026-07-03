@@ -480,7 +480,7 @@ mod tests {
         agent.on_exchange_message(
             0, 0,
             ExchangeMessage::OrderFilled {
-                order_id: 1, user_id: 0, symbol: 0, side: Side::Bid, price: 100, qty: 10,
+                order_id: 1, user_id: 0, symbol: 0, side: Side::Bid, price: 100, qty: 10, remaining: 0,
             },
         );
         assert_eq!(agent.inventory, 10, "bid fill should increase inventory");
@@ -494,7 +494,7 @@ mod tests {
         agent.on_exchange_message(
             0, 0,
             ExchangeMessage::OrderFilled {
-                order_id: 1, user_id: 0, symbol: 0, side: Side::Ask, price: 100, qty: 10,
+                order_id: 1, user_id: 0, symbol: 0, side: Side::Ask, price: 100, qty: 10, remaining: 0,
             },
         );
         assert_eq!(agent.inventory, -10, "ask fill should decrease inventory");
@@ -507,13 +507,13 @@ mod tests {
         agent.on_exchange_message(
             0, 0,
             ExchangeMessage::OrderFilled {
-                order_id: 1, user_id: 0, symbol: 0, side: Side::Bid, price: 100, qty: 10,
+                order_id: 1, user_id: 0, symbol: 0, side: Side::Bid, price: 100, qty: 10, remaining: 0,
             },
         );
         agent.on_exchange_message(
             0, 0,
             ExchangeMessage::OrderFilled {
-                order_id: 2, user_id: 0, symbol: 0, side: Side::Ask, price: 101, qty: 7,
+                order_id: 2, user_id: 0, symbol: 0, side: Side::Ask, price: 101, qty: 7, remaining: 0,
             },
         );
         assert_eq!(agent.inventory, 3, "net inventory should be +10 - 7 = +3");
@@ -528,7 +528,7 @@ mod tests {
         agent.on_exchange_message(
             0, 0,
             ExchangeMessage::OrderFilled {
-                order_id: 999, user_id: 0, symbol: 0, side: Side::Bid, price: 100, qty: 10,
+                order_id: 999, user_id: 0, symbol: 0, side: Side::Bid, price: 100, qty: 10, remaining: 0,
             },
         );
         assert_eq!(agent.inventory, 10, "self-contained fill must count");
