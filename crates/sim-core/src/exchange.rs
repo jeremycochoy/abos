@@ -36,9 +36,20 @@ pub struct RoutedMessage {
     pub message: ExchangeMessage,
 }
 
+/// Identity of a just-created order, as echoed to its owner.
+#[derive(Clone, Copy)]
+struct NewOrder {
+    id: u64,
+    user_id: u64,
+    side: Side,
+    qty: u64,
+}
+
 struct OrderInfo {
     agent_id: AgentId,
     remaining_qty: u64,
+    /// Owner's tag, echoed on every message about the order (0 = unset).
+    user_id: u64,
 }
 
 /// Per-symbol exchange wrapping a [`cda_engine::OrderBook`].
@@ -105,7 +116,11 @@ impl Exchange {
             self.book.cancel_order(oid);
             out.push(RoutedMessage {
                 agent_id: info.agent_id,
-                message: ExchangeMessage::OrderCancelled { order_id: oid },
+                message: ExchangeMessage::OrderCancelled {
+                    order_id: oid,
+                    user_id: info.user_id,
+                    symbol: self.sym,
+                },
             });
         }
         self.resting.clear();
@@ -121,13 +136,16 @@ impl Exchange {
         out: &mut Vec<RoutedMessage>,
     ) {
         if !self.is_open {
-            let oid = match action {
-                OrderAction::CancelOrder { order_id } => order_id,
-                _ => 0,
+            // A new order never receives an id (order_id 0); its echoed
+            // user_id still identifies it. A rejected cancel names its target.
+            let (order_id, user_id) = match action {
+                OrderAction::CancelOrder { order_id } => (order_id, 0),
+                OrderAction::NewLimitOrder { user_id, .. }
+                | OrderAction::NewMarketOrder { user_id, .. } => (0, user_id),
             };
             out.push(RoutedMessage {
                 agent_id,
-                message: ExchangeMessage::OrderRejected { order_id: oid },
+                message: ExchangeMessage::OrderRejected { order_id, user_id, symbol: self.sym },
             });
             return;
         }
@@ -135,31 +153,41 @@ impl Exchange {
         let bbo_before = (self.book.best_bid(), self.book.best_ask());
 
         match action {
-            OrderAction::NewLimitOrder { side, price, qty } => {
-                let oid = self.alloc_id();
+            OrderAction::NewLimitOrder { side, price, qty, user_id } => {
+                let order = NewOrder { id: self.alloc_id(), user_id, side, qty };
+                self.push_accepted(agent_id, order, out);
                 let result = self.book.add_limit_order(LimitOrder {
-                    id: oid, side, price, qty, timestamp: time,
+                    id: order.id, side, price, qty, timestamp: time,
                 });
                 self.record_fills(side, &result.fills, time, out);
-                self.notify_taker(agent_id, oid, qty, &result, out);
+                self.notify_taker(agent_id, order, &result, out);
             }
-            OrderAction::NewMarketOrder { side, qty } => {
-                let oid = self.alloc_id();
-                let result = self.book.add_market_order(MarketOrder { id: oid, side, qty });
+            OrderAction::NewMarketOrder { side, qty, user_id } => {
+                let order = NewOrder { id: self.alloc_id(), user_id, side, qty };
+                self.push_accepted(agent_id, order, out);
+                let result = self.book.add_market_order(MarketOrder { id: order.id, side, qty });
                 self.record_fills(side, &result.fills, time, out);
-                self.notify_taker(agent_id, oid, qty, &result, out);
+                self.notify_taker(agent_id, order, &result, out);
             }
             OrderAction::CancelOrder { order_id } => {
                 if self.book.cancel_order(order_id) {
-                    self.resting.remove(&order_id);
+                    let user_id = self.resting.remove(&order_id).map_or(0, |info| info.user_id);
                     out.push(RoutedMessage {
                         agent_id,
-                        message: ExchangeMessage::OrderCancelled { order_id },
+                        message: ExchangeMessage::OrderCancelled {
+                            order_id,
+                            user_id,
+                            symbol: self.sym,
+                        },
                     });
                 } else {
                     out.push(RoutedMessage {
                         agent_id,
-                        message: ExchangeMessage::OrderRejected { order_id },
+                        message: ExchangeMessage::OrderRejected {
+                            order_id,
+                            user_id: 0,
+                            symbol: self.sym,
+                        },
                     });
                 }
             }
@@ -183,6 +211,24 @@ impl Exchange {
         id
     }
 
+    /// Creation acknowledgment: sent exactly once for every new order —
+    /// including one that fully fills at submission — and always emitted
+    /// before the order's fills. (Per-message latency jitter may still
+    /// deliver a fill first; messages are self-contained so delivery order
+    /// carries no information.)
+    fn push_accepted(&self, agent_id: AgentId, order: NewOrder, out: &mut Vec<RoutedMessage>) {
+        out.push(RoutedMessage {
+            agent_id,
+            message: ExchangeMessage::OrderAccepted {
+                order_id: order.id,
+                user_id: order.user_id,
+                symbol: self.sym,
+                side: order.side,
+                qty: order.qty,
+            },
+        });
+    }
+
     fn record_fills(
         &mut self,
         taker_side: Side,
@@ -190,6 +236,10 @@ impl Exchange {
         time: Nanos,
         out: &mut Vec<RoutedMessage>,
     ) {
+        let maker_side = match taker_side {
+            Side::Bid => Side::Ask,
+            Side::Ask => Side::Bid,
+        };
         for fill in fills {
             self.last_trade_price = Some(fill.price);
             self.last_trade_time = Some(time);
@@ -205,15 +255,19 @@ impl Exchange {
             });
 
             if let Some(info) = self.resting.get_mut(&fill.maker_order_id) {
+                info.remaining_qty = info.remaining_qty.saturating_sub(fill.qty);
                 out.push(RoutedMessage {
                     agent_id: info.agent_id,
                     message: ExchangeMessage::OrderFilled {
                         order_id: fill.maker_order_id,
+                        user_id: info.user_id,
+                        symbol: self.sym,
+                        side: maker_side,
                         price: fill.price,
                         qty: fill.qty,
+                        remaining: info.remaining_qty,
                     },
                 });
-                info.remaining_qty = info.remaining_qty.saturating_sub(fill.qty);
                 if info.remaining_qty == 0 {
                     self.resting.remove(&fill.maker_order_id);
                 }
@@ -224,8 +278,7 @@ impl Exchange {
     fn notify_taker(
         &mut self,
         taker: AgentId,
-        oid: u64,
-        submitted_qty: u64,
+        order: NewOrder,
         result: &cda_engine::OrderResult,
         out: &mut Vec<RoutedMessage>,
     ) {
@@ -236,49 +289,63 @@ impl Exchange {
                 out.push(RoutedMessage {
                     agent_id: taker,
                     message: ExchangeMessage::OrderFilled {
-                        order_id: oid, price: last_price, qty: total,
+                        order_id: order.id,
+                        user_id: order.user_id,
+                        symbol: self.sym,
+                        side: order.side,
+                        price: last_price,
+                        qty: total,
+                        remaining: 0,
                     },
                 });
             }
             OrderStatus::Placed => {
-                self.resting.insert(oid, OrderInfo {
-                    agent_id: taker, remaining_qty: submitted_qty,
-                });
-                out.push(RoutedMessage {
-                    agent_id: taker,
-                    message: ExchangeMessage::OrderAccepted { order_id: oid },
+                self.resting.insert(order.id, OrderInfo {
+                    agent_id: taker, remaining_qty: order.qty, user_id: order.user_id,
                 });
             }
             OrderStatus::Resting { remaining_qty } => {
-                self.resting.insert(oid, OrderInfo {
-                    agent_id: taker, remaining_qty,
+                self.resting.insert(order.id, OrderInfo {
+                    agent_id: taker, remaining_qty, user_id: order.user_id,
                 });
                 let filled: u64 = result.fills.iter().map(|f| f.qty).sum();
                 if filled > 0 {
                     out.push(RoutedMessage {
                         agent_id: taker,
                         message: ExchangeMessage::OrderFilled {
-                            order_id: oid, price: last_price, qty: filled,
+                            order_id: order.id,
+                            user_id: order.user_id,
+                            symbol: self.sym,
+                            side: order.side,
+                            price: last_price,
+                            qty: filled,
+                            remaining: remaining_qty,
                         },
                     });
                 }
-                out.push(RoutedMessage {
-                    agent_id: taker,
-                    message: ExchangeMessage::OrderAccepted { order_id: oid },
-                });
             }
             OrderStatus::Cancelled { filled_qty } => {
                 if filled_qty > 0 {
                     out.push(RoutedMessage {
                         agent_id: taker,
                         message: ExchangeMessage::OrderFilled {
-                            order_id: oid, price: last_price, qty: filled_qty,
+                            order_id: order.id,
+                            user_id: order.user_id,
+                            symbol: self.sym,
+                            side: order.side,
+                            price: last_price,
+                            qty: filled_qty,
+                            remaining: order.qty - filled_qty,
                         },
                     });
                 }
                 out.push(RoutedMessage {
                     agent_id: taker,
-                    message: ExchangeMessage::OrderCancelled { order_id: oid },
+                    message: ExchangeMessage::OrderCancelled {
+                        order_id: order.id,
+                        user_id: order.user_id,
+                        symbol: self.sym,
+                    },
                 });
             }
         }
@@ -298,5 +365,146 @@ impl Exchange {
             ask_volume,
             last_trade_price: self.last_trade_price.unwrap_or(0),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SYM: Symbol = 7;
+
+    fn open_exchange() -> Exchange {
+        let mut ex = Exchange::new(SYM, 1_000_000_000);
+        ex.open(0);
+        ex
+    }
+
+    fn limit(side: Side, price: i64, qty: u64, user_id: u64) -> OrderAction {
+        OrderAction::NewLimitOrder { side, price, qty, user_id }
+    }
+
+    // Every new order gets exactly one creation ack — with symbol, side, qty
+    // and the echoed user_id — before any of its fills, INCLUDING an order
+    // that fully fills at submission (which previously got no ack at all).
+    #[test]
+    fn full_fill_still_gets_creation_ack_before_its_fill() {
+        let mut ex = open_exchange();
+        let mut msgs = Vec::new();
+        ex.process_into(0, limit(Side::Ask, 100, 10, 5), 0, &mut msgs);
+        msgs.clear();
+        ex.process_into(1, limit(Side::Bid, 100, 10, 9), 1, &mut msgs);
+
+        let to_taker: Vec<_> = msgs.iter().filter(|m| m.agent_id == 1).collect();
+        assert_eq!(to_taker.len(), 2, "creation ack + fill");
+        match to_taker[0].message {
+            ExchangeMessage::OrderAccepted { user_id, symbol, side, qty, .. } => {
+                assert_eq!((user_id, symbol, side, qty), (9, SYM, Side::Bid, 10));
+            }
+            other => panic!("first taker message must be the creation ack, got {other:?}"),
+        }
+        match to_taker[1].message {
+            ExchangeMessage::OrderFilled { user_id, symbol, side, qty, remaining, .. } => {
+                assert_eq!((user_id, symbol, side, qty, remaining), (9, SYM, Side::Bid, 10, 0));
+            }
+            other => panic!("second taker message must be the fill, got {other:?}"),
+        }
+    }
+
+    // An order that partially fills at submission and rests: the creation
+    // ack comes first, and the fill reports the outstanding remainder, so an
+    // owner can maintain its resting set from fill content alone.
+    #[test]
+    fn partial_fill_at_submission_emits_ack_then_fill_with_remainder() {
+        let mut ex = open_exchange();
+        let mut msgs = Vec::new();
+        ex.process_into(0, limit(Side::Ask, 100, 4, 5), 0, &mut msgs);
+        msgs.clear();
+        ex.process_into(1, limit(Side::Bid, 100, 10, 9), 1, &mut msgs);
+
+        let to_taker: Vec<_> = msgs.iter().filter(|m| m.agent_id == 1).collect();
+        assert_eq!(to_taker.len(), 2, "creation ack + submission fill");
+        match to_taker[0].message {
+            ExchangeMessage::OrderAccepted { qty, side, .. } => {
+                assert_eq!((qty, side), (10, Side::Bid));
+            }
+            other => panic!("first message must be the creation ack, got {other:?}"),
+        }
+        match to_taker[1].message {
+            ExchangeMessage::OrderFilled { qty, remaining, side, .. } => {
+                assert_eq!((qty, remaining, side), (4, 6, Side::Bid));
+            }
+            other => panic!("second message must be the submission fill, got {other:?}"),
+        }
+    }
+
+    // A fill of a resting order carries the RESTING order's side and its
+    // owner's user_id, not the aggressor's.
+    #[test]
+    fn maker_fill_carries_maker_side_and_user_id() {
+        let mut ex = open_exchange();
+        let mut msgs = Vec::new();
+        ex.process_into(0, limit(Side::Ask, 100, 10, 5), 0, &mut msgs);
+        msgs.clear();
+        ex.process_into(1, limit(Side::Bid, 100, 4, 9), 1, &mut msgs);
+
+        let maker_fill = msgs
+            .iter()
+            .find(|m| m.agent_id == 0)
+            .expect("maker must be notified of the fill");
+        match maker_fill.message {
+            ExchangeMessage::OrderFilled { user_id, symbol, side, qty, remaining, .. } => {
+                assert_eq!((user_id, symbol, side, qty, remaining), (5, SYM, Side::Ask, 4, 6));
+            }
+            other => panic!("maker must receive a fill, got {other:?}"),
+        }
+    }
+
+    // A new order rejected on a closed market has no order id, but its
+    // echoed user_id and symbol still identify it.
+    #[test]
+    fn rejected_new_order_echoes_user_id_and_symbol() {
+        let mut ex = Exchange::new(SYM, 1_000_000_000); // never opened
+        let mut msgs = Vec::new();
+        ex.process_into(3, limit(Side::Bid, 100, 10, 42), 0, &mut msgs);
+        assert_eq!(msgs.len(), 1);
+        match msgs[0].message {
+            ExchangeMessage::OrderRejected { order_id, user_id, symbol } => {
+                assert_eq!((order_id, user_id, symbol), (0, 42, SYM));
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    // Cancels (agent-requested and market-close) echo the order's user_id.
+    #[test]
+    fn cancels_echo_the_orders_user_id() {
+        let mut ex = open_exchange();
+        let mut msgs = Vec::new();
+        ex.process_into(0, limit(Side::Bid, 90, 10, 11), 0, &mut msgs);
+        let oid = match msgs[0].message {
+            ExchangeMessage::OrderAccepted { order_id, .. } => order_id,
+            other => panic!("expected the creation ack, got {other:?}"),
+        };
+
+        msgs.clear();
+        ex.process_into(0, OrderAction::CancelOrder { order_id: oid }, 1, &mut msgs);
+        match msgs[0].message {
+            ExchangeMessage::OrderCancelled { order_id, user_id, symbol } => {
+                assert_eq!((order_id, user_id, symbol), (oid, 11, SYM));
+            }
+            other => panic!("expected the cancel echo, got {other:?}"),
+        }
+
+        msgs.clear();
+        ex.process_into(0, limit(Side::Bid, 90, 10, 12), 2, &mut msgs);
+        msgs.clear();
+        ex.close_into(3, &mut msgs);
+        match msgs[0].message {
+            ExchangeMessage::OrderCancelled { user_id, symbol, .. } => {
+                assert_eq!((user_id, symbol), (12, SYM));
+            }
+            other => panic!("expected the close-cancel echo, got {other:?}"),
+        }
     }
 }

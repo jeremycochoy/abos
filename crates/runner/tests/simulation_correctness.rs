@@ -108,6 +108,7 @@ impl Agent for MarketOnlyAgent {
             order: OrderAction::NewMarketOrder {
                 side: cda_engine::Side::Bid,
                 qty: 1,
+                user_id: 0,
             },
         });
         out.push(AgentAction::ScheduleWakeUp { delay_ns: 1_000_000 });
@@ -134,6 +135,7 @@ impl Agent for LimitOnlyAgent {
                 side: self.side,
                 price: self.price,
                 qty: 1,
+                user_id: 0,
             },
         });
         out.push(AgentAction::ScheduleWakeUp { delay_ns: 1_000_000 });

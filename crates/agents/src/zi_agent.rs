@@ -115,7 +115,7 @@ impl Agent for ZiAgent {
 
         actions.push(AgentAction::SubmitOrder {
             symbol: self.symbol,
-            order: OrderAction::NewLimitOrder { side, price, qty },
+            order: OrderAction::NewLimitOrder { side, price, qty, user_id: 0 },
         });
 
         actions.push(AgentAction::ScheduleWakeUp {
@@ -130,11 +130,11 @@ impl Agent for ZiAgent {
         message: ExchangeMessage,
     ) {
         match message {
-            ExchangeMessage::OrderAccepted { order_id } => {
+            ExchangeMessage::OrderAccepted { order_id, .. } => {
                 self.resting_orders.insert(order_id);
             }
             ExchangeMessage::OrderFilled { order_id, .. }
-            | ExchangeMessage::OrderCancelled { order_id } => {
+            | ExchangeMessage::OrderCancelled { order_id, .. } => {
                 self.resting_orders.remove(order_id);
             }
             ExchangeMessage::OrderRejected { .. } => {}
@@ -181,9 +181,9 @@ mod tests {
     #[test]
     fn wakeup_cancels_all_resting_orders() {
         let mut agent = ZiAgent::new(default_cfg(), 42);
-        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 100 });
-        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 200 });
-        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 300 });
+        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 100, user_id: 0, symbol: 0, side: Side::Bid, qty: 1 });
+        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 200, user_id: 0, symbol: 0, side: Side::Bid, qty: 1 });
+        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 300, user_id: 0, symbol: 0, side: Side::Bid, qty: 1 });
 
         let snaps = snapshot_with_mid(9_999_000, 10_001_000);
         let mut actions = Vec::new();

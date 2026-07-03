@@ -3,20 +3,50 @@ use std::cmp::Ordering;
 use crate::types::{AgentId, Nanos, Symbol};
 
 /// An action an agent wants to perform on a symbol's order book.
+///
+/// `user_id` is an agent-chosen tag echoed verbatim on every exchange message
+/// about the order (`0` = unset). It lets an agent attribute echoes to its
+/// own bookkeeping directly (e.g. a per-market slot index) instead of
+/// decoding exchange-assigned order ids.
 #[derive(Debug, Clone, Copy)]
 pub enum OrderAction {
-    NewLimitOrder { side: cda_engine::Side, price: i64, qty: u64 },
-    NewMarketOrder { side: cda_engine::Side, qty: u64 },
+    NewLimitOrder { side: cda_engine::Side, price: i64, qty: u64, user_id: u64 },
+    NewMarketOrder { side: cda_engine::Side, qty: u64, user_id: u64 },
     CancelOrder { order_id: u64 },
 }
 
 /// A message sent from the exchange back to an agent.
+///
+/// Every message is self-contained: it names the market (`symbol`), echoes
+/// the submitting agent's `user_id` tag (`0` = unset), and creation/fill
+/// messages carry the ORDER OWNER's side and quantity. No message needs to
+/// be correlated with another one to be interpreted.
 #[derive(Debug, Clone, Copy)]
 pub enum ExchangeMessage {
-    OrderAccepted { order_id: u64 },
-    OrderFilled { order_id: u64, price: i64, qty: u64 },
-    OrderCancelled { order_id: u64 },
-    OrderRejected { order_id: u64 },
+    /// Sent exactly once for every order the exchange creates — including an
+    /// order that fully fills at submission — and always before any of its
+    /// fills.
+    OrderAccepted { order_id: u64, user_id: u64, symbol: Symbol, side: cda_engine::Side, qty: u64 },
+    /// One fill of the order. `side` is the order owner's side (for a fill
+    /// of a resting order, that is the resting order's side). `remaining` is
+    /// the order's unfilled quantity AFTER this fill: 0 means the order is
+    /// done, a positive value means it is still resting — so an owner can
+    /// maintain its resting-order set from fills alone, without inferring
+    /// lifecycle from message ordering.
+    OrderFilled {
+        order_id: u64,
+        user_id: u64,
+        symbol: Symbol,
+        side: cda_engine::Side,
+        price: i64,
+        qty: u64,
+        remaining: u64,
+    },
+    OrderCancelled { order_id: u64, user_id: u64, symbol: Symbol },
+    /// A rejected NEW order is reported with `order_id` 0 (no id is ever
+    /// allocated for it); its echoed `user_id` and `symbol` still identify
+    /// it. A rejected cancel carries the cancel's target `order_id`.
+    OrderRejected { order_id: u64, user_id: u64, symbol: Symbol },
 }
 
 /// Payload carried by each event in the simulation queue.

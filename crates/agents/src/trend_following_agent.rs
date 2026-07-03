@@ -119,8 +119,10 @@ impl TrendFollowingAgent {
     fn determine_side(&self, ma_diff: f64) -> Side {
         if self.cfg.contrarian {
             if ma_diff > 0.0 { Side::Ask } else { Side::Bid }
+        } else if ma_diff > 0.0 {
+            Side::Bid
         } else {
-            if ma_diff > 0.0 { Side::Bid } else { Side::Ask }
+            Side::Ask
         }
     }
 }
@@ -173,7 +175,7 @@ impl Agent for TrendFollowingAgent {
 
                 actions.push(AgentAction::SubmitOrder {
                     symbol: self.cfg.symbol,
-                    order: OrderAction::NewLimitOrder { side, price, qty },
+                    order: OrderAction::NewLimitOrder { side, price, qty, user_id: 0 },
                 });
             }
         }
@@ -190,11 +192,11 @@ impl Agent for TrendFollowingAgent {
         message: ExchangeMessage,
     ) {
         match message {
-            ExchangeMessage::OrderAccepted { order_id } => {
+            ExchangeMessage::OrderAccepted { order_id, .. } => {
                 self.resting_orders.insert(order_id);
             }
             ExchangeMessage::OrderFilled { order_id, .. }
-            | ExchangeMessage::OrderCancelled { order_id } => {
+            | ExchangeMessage::OrderCancelled { order_id, .. } => {
                 self.resting_orders.remove(order_id);
             }
             ExchangeMessage::OrderRejected { .. } => {}
@@ -388,8 +390,8 @@ mod tests {
         cfg.threshold = 0.0;
         let mut agent = TrendFollowingAgent::new(cfg, 42);
 
-        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 10 });
-        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 20 });
+        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 10, user_id: 0, symbol: 0, side: Side::Bid, qty: 1 });
+        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 20, user_id: 0, symbol: 0, side: Side::Bid, qty: 1 });
 
         agent.price_history.push_back(9000.0);
         agent.price_history.push_back(9100.0);
