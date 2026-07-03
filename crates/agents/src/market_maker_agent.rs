@@ -1,5 +1,3 @@
-use std::collections::{HashMap, VecDeque};
-
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 
@@ -44,12 +42,9 @@ pub struct MarketMakerAgent {
     resting_orders: IndexedSet,
     weight_model: Box<dyn LiquidityWeightModel>,
     wakeup_sampler: Box<dyn WakeupSampler>,
-    /// Net inventory (positive = long, negative = short).
+    /// Net inventory (positive = long, negative = short), advanced from the
+    /// side carried by each `OrderFilled` message.
     inventory: i64,
-    /// Maps `order_id` → `Side` so we know the direction when a fill arrives.
-    order_sides: HashMap<u64, Side>,
-    /// Sides of pending submissions, matched to `OrderAccepted` in FIFO order.
-    pending_sides: VecDeque<Side>,
 }
 
 impl MarketMakerAgent {
@@ -82,8 +77,6 @@ impl MarketMakerAgent {
             weight_model,
             wakeup_sampler,
             inventory: 0,
-            order_sides: HashMap::new(),
-            pending_sides: VecDeque::new(),
         }
     }
 
@@ -125,7 +118,6 @@ impl Agent for MarketMakerAgent {
 
         // Cancel all outstanding orders
         for oid in self.resting_orders.drain_all() {
-            self.order_sides.remove(&oid);
             actions.push(AgentAction::CancelOrder {
                 symbol: self.cfg.symbol,
                 order_id: oid,
@@ -161,10 +153,9 @@ impl Agent for MarketMakerAgent {
                 if qty == 0 { continue; }
                 let price = (mid as f64 * (-log_dist).exp()).round() as i64;
                 if price < 1 { continue; }
-                self.pending_sides.push_back(Side::Bid);
                 actions.push(AgentAction::SubmitOrder {
                     symbol: self.cfg.symbol,
-                    order: OrderAction::NewLimitOrder { side: Side::Bid, price, qty },
+                    order: OrderAction::NewLimitOrder { side: Side::Bid, price, qty, user_id: 0 },
                 });
             }
         }
@@ -175,10 +166,9 @@ impl Agent for MarketMakerAgent {
                 let qty = (half_liq * weight / ask_total).round() as u64;
                 if qty == 0 { continue; }
                 let price = (mid as f64 * log_dist.exp()).round() as i64;
-                self.pending_sides.push_back(Side::Ask);
                 actions.push(AgentAction::SubmitOrder {
                     symbol: self.cfg.symbol,
-                    order: OrderAction::NewLimitOrder { side: Side::Ask, price, qty },
+                    order: OrderAction::NewLimitOrder { side: Side::Ask, price, qty, user_id: 0 },
                 });
             }
         }
@@ -195,26 +185,22 @@ impl Agent for MarketMakerAgent {
         _agent_id: AgentId,
         message: ExchangeMessage,
     ) {
+        // Every message is self-contained: fills carry the order's side, so
+        // inventory needs no submit-time bookkeeping to attribute direction.
         match message {
-            ExchangeMessage::OrderAccepted { order_id } => {
+            ExchangeMessage::OrderAccepted { order_id, .. } => {
                 self.resting_orders.insert(order_id);
-                if let Some(side) = self.pending_sides.pop_front() {
-                    self.order_sides.insert(order_id, side);
-                }
             }
-            ExchangeMessage::OrderFilled { order_id, qty, .. } => {
+            ExchangeMessage::OrderFilled { order_id, side, qty, .. } => {
                 self.resting_orders.remove(order_id);
                 #[allow(clippy::cast_possible_wrap)]
-                if let Some(side) = self.order_sides.remove(&order_id) {
-                    match side {
-                        Side::Bid => self.inventory += qty as i64,
-                        Side::Ask => self.inventory -= qty as i64,
-                    }
+                match side {
+                    Side::Bid => self.inventory += qty as i64,
+                    Side::Ask => self.inventory -= qty as i64,
                 }
             }
-            ExchangeMessage::OrderCancelled { order_id } => {
+            ExchangeMessage::OrderCancelled { order_id, .. } => {
                 self.resting_orders.remove(order_id);
-                self.order_sides.remove(&order_id);
             }
             ExchangeMessage::OrderRejected { .. } => {}
         }
@@ -389,9 +375,9 @@ mod tests {
     #[test]
     fn cancels_all_resting_before_placing() {
         let mut agent = MarketMakerAgent::new(default_cfg(), 42);
-        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 10 });
-        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 20 });
-        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 30 });
+        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 10, user_id: 0, symbol: 0, side: Side::Bid, qty: 10 });
+        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 20, user_id: 0, symbol: 0, side: Side::Bid, qty: 10 });
+        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 30, user_id: 0, symbol: 0, side: Side::Bid, qty: 10 });
 
         let snaps = snap_at_price(10_000);
         let mut actions = Vec::new();
@@ -491,11 +477,11 @@ mod tests {
         let mut agent = MarketMakerAgent::new(default_cfg(), 42);
         assert_eq!(agent.inventory, 0);
 
-        agent.pending_sides.push_back(Side::Bid);
-        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 1 });
         agent.on_exchange_message(
             0, 0,
-            ExchangeMessage::OrderFilled { order_id: 1, price: 100, qty: 10 },
+            ExchangeMessage::OrderFilled {
+                order_id: 1, user_id: 0, symbol: 0, side: Side::Bid, price: 100, qty: 10,
+            },
         );
         assert_eq!(agent.inventory, 10, "bid fill should increase inventory");
     }
@@ -505,11 +491,11 @@ mod tests {
         let mut agent = MarketMakerAgent::new(default_cfg(), 42);
         assert_eq!(agent.inventory, 0);
 
-        agent.pending_sides.push_back(Side::Ask);
-        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 1 });
         agent.on_exchange_message(
             0, 0,
-            ExchangeMessage::OrderFilled { order_id: 1, price: 100, qty: 10 },
+            ExchangeMessage::OrderFilled {
+                order_id: 1, user_id: 0, symbol: 0, side: Side::Ask, price: 100, qty: 10,
+            },
         );
         assert_eq!(agent.inventory, -10, "ask fill should decrease inventory");
     }
@@ -518,29 +504,34 @@ mod tests {
     fn mixed_fills_track_net_inventory() {
         let mut agent = MarketMakerAgent::new(default_cfg(), 42);
 
-        agent.pending_sides.push_back(Side::Bid);
-        agent.pending_sides.push_back(Side::Ask);
-        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 1 });
-        agent.on_exchange_message(0, 0, ExchangeMessage::OrderAccepted { order_id: 2 });
         agent.on_exchange_message(
             0, 0,
-            ExchangeMessage::OrderFilled { order_id: 1, price: 100, qty: 10 },
+            ExchangeMessage::OrderFilled {
+                order_id: 1, user_id: 0, symbol: 0, side: Side::Bid, price: 100, qty: 10,
+            },
         );
         agent.on_exchange_message(
             0, 0,
-            ExchangeMessage::OrderFilled { order_id: 2, price: 101, qty: 7 },
+            ExchangeMessage::OrderFilled {
+                order_id: 2, user_id: 0, symbol: 0, side: Side::Ask, price: 101, qty: 7,
+            },
         );
         assert_eq!(agent.inventory, 3, "net inventory should be +10 - 7 = +3");
     }
 
+    // The exchange sends no accept-then-fill correlation requirement any
+    // more: a fill that arrives before (or without) its accept still counts,
+    // because it carries its own side.
     #[test]
-    fn unknown_fill_does_not_change_inventory() {
+    fn fill_without_prior_accept_still_counts() {
         let mut agent = MarketMakerAgent::new(default_cfg(), 42);
         agent.on_exchange_message(
             0, 0,
-            ExchangeMessage::OrderFilled { order_id: 999, price: 100, qty: 10 },
+            ExchangeMessage::OrderFilled {
+                order_id: 999, user_id: 0, symbol: 0, side: Side::Bid, price: 100, qty: 10,
+            },
         );
-        assert_eq!(agent.inventory, 0, "unknown fill should not change inventory");
+        assert_eq!(agent.inventory, 10, "self-contained fill must count");
     }
 
     // ── Custom samplers via with_samplers ────────────────────────────
