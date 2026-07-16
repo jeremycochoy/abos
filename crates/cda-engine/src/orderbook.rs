@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::fills::{Fill, OrderResult, OrderStatus};
 use crate::order::{LimitOrder, MarketOrder, RestingOrder, Side};
@@ -11,15 +11,17 @@ struct PriceLevel {
 
 /// A continuous double-auction order book with price-time (FIFO) priority.
 ///
-/// Uses lazy (tombstone) cancellation: cancelled orders remain in the queue
-/// and are skipped during matching. This gives O(1) cancel instead of O(n).
+/// Uses lazy (tombstone) cancellation: a cancelled order stays queued at its
+/// price level and is skipped when matching reaches it. This gives O(1) cancel
+/// instead of O(n). `orders` is the authority on what is live, so a queue entry
+/// missing from it *is* the tombstone — no separate set of cancelled ids is
+/// kept, which is what bounds the book's memory over a long run.
 pub struct OrderBook {
     bids: BTreeMap<i64, PriceLevel>,
     asks: BTreeMap<i64, PriceLevel>,
     /// `order_id` → (side, price, `remaining_qty`) for O(1) cancel.
+    /// Holds exactly the live resting orders.
     orders: HashMap<u64, (Side, i64, u64)>,
-    /// Order IDs that have been cancelled but not yet removed from queues.
-    cancelled: HashSet<u64>,
     /// Reusable fill buffer to avoid per-call allocation.
     fill_buf: Vec<Fill>,
 }
@@ -32,7 +34,6 @@ impl OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             orders: HashMap::new(),
-            cancelled: HashSet::new(),
             fill_buf: Vec::new(),
         }
     }
@@ -97,6 +98,9 @@ impl OrderBook {
     }
 
     /// Cancel a resting order by ID. Returns `true` if the order was found and removed.
+    ///
+    /// Dropping the order from `orders` is what marks it cancelled; its queue
+    /// entry is left behind as a tombstone for matching to skip.
     pub fn cancel_order(&mut self, order_id: u64) -> bool {
         let Some((side, price, remaining_qty)) = self.orders.remove(&order_id) else {
             return false;
@@ -108,13 +112,11 @@ impl OrderBook {
         };
         if let Some(level) = book_side.get_mut(&price) {
             level.total_qty -= remaining_qty;
-            // If no volume left, eagerly remove the level
+            // No live volume left: drop the level, discarding its tombstones.
             if level.total_qty == 0 {
                 book_side.remove(&price);
             }
         }
-        // Mark as tombstone; the queue entry will be skipped during matching
-        self.cancelled.insert(order_id);
         true
     }
 
@@ -177,9 +179,13 @@ impl OrderBook {
     }
 
     /// Pop cancelled tombstones from the front of a price level's queue.
-    fn drain_tombstones(level: &mut PriceLevel, cancelled: &mut HashSet<u64>) {
+    ///
+    /// A queued order is a tombstone exactly when `orders` no longer holds it:
+    /// a full fill drops it from the queue and from `orders` together, so a
+    /// queue entry with no `orders` record can only have been cancelled.
+    fn drain_tombstones(level: &mut PriceLevel, orders: &HashMap<u64, (Side, i64, u64)>) {
         while let Some(front) = level.orders.front() {
-            if !cancelled.remove(&front.id) {
+            if orders.contains_key(&front.id) {
                 break;
             }
             level.orders.pop_front();
@@ -195,7 +201,7 @@ impl OrderBook {
         };
         let level = book_side.get_mut(&price).expect("price level must exist");
 
-        Self::drain_tombstones(level, &mut self.cancelled);
+        Self::drain_tombstones(level, &self.orders);
 
         while *remaining > 0 {
             let Some(front) = level.orders.front_mut() else { break };
@@ -222,7 +228,7 @@ impl OrderBook {
                 entry.2 -= fill_qty;
             }
 
-            Self::drain_tombstones(level, &mut self.cancelled);
+            Self::drain_tombstones(level, &self.orders);
         }
 
         if level.orders.is_empty() {
