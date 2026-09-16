@@ -56,17 +56,13 @@ impl IndexedSet {
 }
 
 /// Compute mid-price from a market snapshot, falling back to `reference`.
-///
-/// A half-tick mid goes to the even neighbour, so the rounding error cancels
-/// over many books. Truncation would cut the half tick on every odd spread and
-/// push the price down, by an amount that matters when a tick is a large
-/// fraction of the price.
 pub(crate) fn mid_price(snap: &MarketSnapshot, reference: i64) -> i64 {
     match (snap.best_bid, snap.best_ask) {
+        // A mid between two ticks rounds down half of the time and up half of the time,
+        // so the two rounding errors cancel on average. It rounds to the even tick.
         (Some((bid, _)), Some((ask, _))) => {
-            let half = i64::midpoint(bid, ask); // Rounds down: prices are positive
-            let odd_spread = (bid ^ ask) & 1;
-            half + odd_spread * half.rem_euclid(2)
+            let below = i64::midpoint(bid, ask);
+            if (bid + ask) % 2 != 0 && below % 2 != 0 { below + 1 } else { below }
         }
         (Some((bid, _)), None) => bid,
         (None, Some((ask, _))) => ask,
