@@ -292,6 +292,29 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
+    fn lognormal_price_draw_has_zero_mean() {
+        for price_std in [0.0003, 0.003, 0.1, 1.0] {
+            let sampler = LogNormalPriceSampler::new(price_std);
+            assert_eq!(sampler.normal.mean(), 0.0, "price_std {price_std}");
+            assert_eq!(sampler.normal.std_dev(), (1.0 + price_std).ln(), "price_std {price_std}");
+        }
+    }
+
+    /// Half of the quotes land below the mid. The old mean of the draw,
+    /// -σ²/2, put 64 % of them below the mid at σ = ln 2.
+    #[test]
+    fn lognormal_price_log_centers_on_mid() {
+        let mut sampler = LogNormalPriceSampler::new(1.0);
+        let mut rng = SmallRng::seed_from_u64(42);
+        let mid: i64 = 10_000_000;
+        let n = 50_000;
+        let below = (0..n).filter(|_| sampler.sample_price(mid, &mut rng) < mid).count();
+        let share = below as f64 / f64::from(n);
+        assert!((share - 0.5).abs() < 0.01, "{share:.3} of the quotes land below the mid");
+    }
+
+    #[test]
     fn lognormal_size_distribution_mean() {
         let mut sampler = LogNormalSizeSampler::new(12_000.0, 1.7);
         let mut rng = SmallRng::seed_from_u64(42);
