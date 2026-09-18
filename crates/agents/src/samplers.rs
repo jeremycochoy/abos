@@ -69,7 +69,15 @@ pub trait LiquidityWeightModel {
 // Default implementations — ZI
 // ═══════════════════════════════════════════════════════════════════
 
-/// Log-normal price sampler: `price = mid * exp(N(-σ²/2, σ))` where `σ = ln(1 + price_std)`.
+/// Log-normal price sampler: `price = mid * exp(N(0, σ))` where `σ = ln(1 + price_std)`.
+///
+/// The log of each quote centers on the mid. Until `jeremycochoy/evolve_trading#161`
+/// the mean of the draw was -σ²/2, the ABIDES formula. That tilt put the log of
+/// each quote σ²/2 below the log of the mid, and the price fell. Over 5 replays
+/// of 360 days of a 4-market simulation, the mean log return of the markets was
+/// -2.05 with the tilt and +0.44 without it, and the real markets give +0.09.
+/// The change moves every simulation, as the mid-price rounding did, thus a
+/// result of an older build does not reproduce.
 pub struct LogNormalPriceSampler {
     normal: Normal<f64>,
 }
@@ -79,8 +87,7 @@ impl LogNormalPriceSampler {
     pub fn new(price_std: f64) -> Self {
         let log_std = (1.0 + price_std).ln();
         Self {
-            normal: Normal::new(-0.5 * log_std * log_std, log_std)
-                .expect("invalid price distribution params"),
+            normal: Normal::new(0.0, log_std).expect("invalid price distribution params"),
         }
     }
 }
@@ -289,6 +296,29 @@ mod tests {
             relative_std > 0.0001,
             "relative std {relative_std:.6} too small for price_std=0.0003"
         );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn lognormal_price_draw_has_zero_mean() {
+        for price_std in [0.0003, 0.003, 0.1, 1.0] {
+            let sampler = LogNormalPriceSampler::new(price_std);
+            assert_eq!(sampler.normal.mean(), 0.0, "price_std {price_std}");
+            assert_eq!(sampler.normal.std_dev(), (1.0 + price_std).ln(), "price_std {price_std}");
+        }
+    }
+
+    /// Half of the quotes land below the mid. The old mean of the draw,
+    /// -σ²/2, put 64 % of them below the mid at σ = ln 2.
+    #[test]
+    fn lognormal_price_log_centers_on_mid() {
+        let mut sampler = LogNormalPriceSampler::new(1.0);
+        let mut rng = SmallRng::seed_from_u64(42);
+        let mid: i64 = 10_000_000;
+        let n = 50_000;
+        let below = (0..n).filter(|_| sampler.sample_price(mid, &mut rng) < mid).count();
+        let share = below as f64 / f64::from(n);
+        assert!((share - 0.5).abs() < 0.01, "{share:.3} of the quotes land below the mid");
     }
 
     #[test]

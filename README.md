@@ -60,7 +60,7 @@ Discrete-event simulation with `BinaryHeap<Event>` priority queue. Features:
 | **Contrarian** | MA crossover → mean-revert against trend | Same as TF with `contrarian: true` |
 | **MarketMaker** | Multi-level symmetric-hump quotes with inventory skew | `total_liquidity`, `max_levels`, `imbalance_beta` |
 
-The ZI agent matches the ABIDES `ZeroIntelligence` implementation (lognormal price distribution, lognormal order size, cancel-all-then-place cycle). The trend-following and contrarian agents match the `TrendFollowingAgent` from `evolve_trading/simple_4agents_model`. The market maker uses the `SymmetricHumpLiquidityModel` from ABIDES.
+The ZI agent matches the ABIDES `ZeroIntelligence` implementation (lognormal price distribution, lognormal order size, cancel-all-then-place cycle), with one difference: the log of each quote centers on the mid. ABIDES gives the log-normal price draw the mean -σ²/2, which puts the log of each quote σ²/2 below the mid, and over a long run the price falls ([evolve_trading#161](https://github.com/jeremycochoy/evolve_trading/issues/161)). The trend-following and contrarian agents match the `TrendFollowingAgent` from `evolve_trading/simple_4agents_model`. The market maker uses the `SymmetricHumpLiquidityModel` from ABIDES.
 
 ### Latency Models
 

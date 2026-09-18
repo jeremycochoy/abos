@@ -132,7 +132,7 @@ Object-safe, zero-allocation design (actions written to borrowed buffer).
 Matching engine: placement, fills, partial fills, sweeps, FIFO, cancels, BBO, spread, volume.
 
 ### agents: unit tests (43 tests)
-- **ZiAgent** (10 tests): Price distribution center/std matches ABIDES lognormal formula, order size distribution mean/min, cancel-all, exactly one limit order, fixed-interval wakeup, 50/50 side balance, reference price fallback.
+- **ZiAgent** (10 tests): Price distribution center/std (the log of the price centers on the mid, not at the ABIDES -σ²/2), order size distribution mean/min, cancel-all, exactly one limit order, fixed-interval wakeup, 50/50 side balance, reference price fallback.
 - **TrendFollowingAgent** (14 tests): Raw-price storage regression, log-ratio signal regression, MA computation, insufficient history, TF buy/sell/threshold, contrarian sell/buy/threshold, order size proportional to signal, price offset, no trade before enough candles, candle sampling frequency, cancel-all before trading.
 - **MarketMakerAgent** (19 tests): Hump weight positivity/peak-decay/symmetry, inventory imbalance (zero/positive/negative/bounded), both-sides placement, correct number of levels, bid below/ask above mid, total qty matches budget, cancel-all before placing, per-side normalization balances sides, geometric mid-price/fallback, bid fill increases inventory, ask fill decreases inventory, mixed fills net inventory, unknown fill safety.
 

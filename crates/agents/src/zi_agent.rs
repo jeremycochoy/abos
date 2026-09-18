@@ -48,7 +48,8 @@ pub struct ZiAgent {
 }
 
 impl ZiAgent {
-    /// Create a ZI agent with default log-normal samplers matching the ABIDES implementation.
+    /// Create a ZI agent with the default log-normal samplers of the ABIDES implementation.
+    /// The price draw centers on the mid, not σ²/2 below it: see [`LogNormalPriceSampler`].
     #[must_use]
     pub fn new(config: ZiAgentConfig, seed: u64) -> Self {
         Self::with_samplers(
