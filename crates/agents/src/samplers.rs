@@ -69,7 +69,15 @@ pub trait LiquidityWeightModel {
 // Default implementations — ZI
 // ═══════════════════════════════════════════════════════════════════
 
-/// Log-normal price sampler: `price = mid * exp(N(-σ²/2, σ))` where `σ = ln(1 + price_std)`.
+/// Log-normal price sampler: `price = mid * exp(N(0, σ))` where `σ = ln(1 + price_std)`.
+///
+/// The log of each quote centers on the mid. Until `jeremycochoy/evolve_trading#161`
+/// the mean of the draw was -σ²/2, the ABIDES formula. That tilt put the log of
+/// each quote σ²/2 below the log of the mid, and the price fell. Over 5 replays
+/// of 360 days of a 4-market simulation, the mean log return of the markets was
+/// -2.05 with the tilt and +0.44 without it, and the real markets give +0.09.
+/// The change moves every simulation, as the mid-price rounding did, thus a
+/// result of an older build does not reproduce.
 pub struct LogNormalPriceSampler {
     normal: Normal<f64>,
 }
@@ -79,8 +87,7 @@ impl LogNormalPriceSampler {
     pub fn new(price_std: f64) -> Self {
         let log_std = (1.0 + price_std).ln();
         Self {
-            normal: Normal::new(-0.5 * log_std * log_std, log_std)
-                .expect("invalid price distribution params"),
+            normal: Normal::new(0.0, log_std).expect("invalid price distribution params"),
         }
     }
 }
