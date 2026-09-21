@@ -39,11 +39,11 @@ Zero-dependency, single-threaded order book with price-time (FIFO) priority.
 | `best_bid() / best_ask()` | Best price on each side |
 | `spread()` | Ask minus bid |
 
-**Internals:** `BTreeMap<i64, PriceLevel>` per side for price-level ordering, `HashMap` + `HashSet` tombstones for O(1) cancel. Reusable `Vec<Fill>` buffer avoids per-operation allocation.
+**Internals:** `BTreeMap<i64, PriceLevel>` per side for price-level ordering, a fast integer-key map plus tombstones for O(1) cancel, a cached best level per side for O(1) BBO reads, and a pool of retired level queues. `add_limit_order_into` and `add_market_order_into` append fills to a caller buffer without allocation.
 
 ### Simulation Kernel (`sim-core`)
 
-Discrete-event simulation with `BinaryHeap<Event>` priority queue. Features:
+Discrete-event simulation with a compact (time, seq)-keyed binary heap. Exchange responses skip the queue: the kernel applies them from per-agent inboxes right before the agent's next wakeup, with their original delivery times, in exact (time, seq) order. Features:
 
 - Per-symbol `Exchange` wrapping the CDA engine
 - Exchange-assigned unique order IDs
