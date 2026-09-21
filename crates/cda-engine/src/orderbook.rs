@@ -29,6 +29,9 @@ pub struct OrderBook {
     best_bid_cache: Option<(i64, u64)>,
     /// Cached best ask as (price, live volume).
     best_ask_cache: Option<(i64, u64)>,
+    /// Retired level queues, kept for reuse so level churn stays off the
+    /// allocator.
+    level_pool: Vec<VecDeque<RestingOrder>>,
 }
 
 impl OrderBook {
@@ -41,6 +44,7 @@ impl OrderBook {
             orders: FxHashMap::default(),
             best_bid_cache: None,
             best_ask_cache: None,
+            level_pool: Vec::new(),
         }
     }
 
@@ -136,7 +140,10 @@ impl OrderBook {
             level.total_qty -= remaining_qty;
             // No live volume left: drop the level, discarding its tombstones.
             if level.total_qty == 0 {
-                book_side.remove(&price);
+                if let Some(mut level) = book_side.remove(&price) {
+                    level.orders.clear();
+                    self.level_pool.push(level.orders);
+                }
             }
         }
         if self.reaches_best(side, price) {
@@ -313,7 +320,9 @@ impl OrderBook {
         }
 
         if level.orders.is_empty() {
-            book_side.remove(&price);
+            if let Some(level) = book_side.remove(&price) {
+                self.level_pool.push(level.orders);
+            }
         }
         self.refresh_best(match taker_side {
             Side::Bid => Side::Ask,
@@ -329,7 +338,7 @@ impl OrderBook {
             Side::Ask => &mut self.asks,
         };
         let level = book_side.entry(price).or_insert_with(|| PriceLevel {
-            orders: VecDeque::new(),
+            orders: self.level_pool.pop().unwrap_or_default(),
             total_qty: 0,
         });
         level.total_qty += order.qty;
