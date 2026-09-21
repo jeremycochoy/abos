@@ -161,6 +161,7 @@ pub struct FlowBucket {
     /// Watched new orders rejected at exchange arrival during this interval.
     pub rejected_orders: u64,
     /// Distinct accepted orders carried into or accepted during this interval.
+    /// A carried order canceled in the interval remains in this cohort.
     pub eligible_orders: u64,
     /// Distinct eligible orders with an external fill during this interval.
     pub filled_orders: u64,
@@ -710,6 +711,8 @@ impl Exchange {
     }
 
     /// Resolve responses through `end_time`, exclude later horizons, and drain the interval rows.
+    /// Events at `end_time` enter the final interval without repeating filled orders.
+    /// Only newly accepted terminal orders increase that interval's eligible cohort.
     /// Call once after the last event. `None` means flow recording was disabled.
     #[must_use]
     pub fn flush_flow(&mut self, end_time: Nanos) -> Option<(Vec<FlowBucket>, FlowTotals)> {
