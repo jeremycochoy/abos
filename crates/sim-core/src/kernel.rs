@@ -57,10 +57,10 @@ struct InboxEntry {
 }
 
 /// The global event queue: a binary min-heap of ((time, seq), slot) keys
-/// with the payloads parked in a slot arena. A sift moves 24 bytes instead
-/// of a whole event, and a popped slot is reused by the next push. Keys are
-/// unique, so the pop order is the exact (time, seq) order of the former
-/// `BinaryHeap<Event>`.
+/// with the payloads parked in a slot arena. A sift moves one 32-byte entry
+/// instead of a 56-byte event, and a popped slot is reused by the next
+/// push. Keys are unique, so the pop order is the exact (time, seq) order
+/// of the former `BinaryHeap<Event>`.
 struct EventQueue {
     heap: Vec<HeapEntry>,
     slots: Vec<Option<EventPayload>>,
