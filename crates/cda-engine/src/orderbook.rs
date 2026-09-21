@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
+
+use crate::fasthash::FxHashMap;
 
 use crate::fills::{Fill, OrderResult, OrderStatus};
 use crate::order::{LimitOrder, MarketOrder, RestingOrder, Side};
@@ -21,9 +23,15 @@ pub struct OrderBook {
     asks: BTreeMap<i64, PriceLevel>,
     /// `order_id` → (side, price, `remaining_qty`) for O(1) cancel.
     /// Holds exactly the live resting orders.
-    orders: HashMap<u64, (Side, i64, u64)>,
-    /// Reusable fill buffer to avoid per-call allocation.
-    fill_buf: Vec<Fill>,
+    orders: FxHashMap<u64, (Side, i64, u64)>,
+    /// Cached best bid as (price, live volume), kept in step with `bids` so
+    /// hot-path BBO reads cost no tree walk.
+    best_bid_cache: Option<(i64, u64)>,
+    /// Cached best ask as (price, live volume).
+    best_ask_cache: Option<(i64, u64)>,
+    /// Retired level queues, kept for reuse so level churn stays off the
+    /// allocator.
+    level_pool: Vec<VecDeque<RestingOrder>>,
 }
 
 impl OrderBook {
@@ -33,8 +41,10 @@ impl OrderBook {
         Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
-            orders: HashMap::new(),
-            fill_buf: Vec::new(),
+            orders: FxHashMap::default(),
+            best_bid_cache: None,
+            best_ask_cache: None,
+            level_pool: Vec::new(),
         }
     }
 
@@ -43,18 +53,28 @@ impl OrderBook {
     /// # Panics
     /// Panics in debug mode if `qty == 0` or `price < 0`.
     pub fn add_limit_order(&mut self, order: LimitOrder) -> OrderResult {
+        let mut fills = Vec::new();
+        let status = self.add_limit_order_into(order, &mut fills);
+        OrderResult { fills, status }
+    }
+
+    /// Submit a limit order, appending its fills to `fills` instead of
+    /// allocating a result. The hot path of [`Self::add_limit_order`].
+    ///
+    /// # Panics
+    /// Panics in debug mode if `qty == 0` or `price < 0`.
+    pub fn add_limit_order_into(&mut self, order: LimitOrder, fills: &mut Vec<Fill>) -> OrderStatus {
         debug_assert!(order.qty > 0, "limit order qty must be > 0");
         debug_assert!(order.price >= 0, "price must be non-negative");
 
-        self.fill_buf.clear();
         let mut remaining = order.qty;
 
         match order.side {
-            Side::Bid => self.match_against_asks(order.id, order.price, &mut remaining),
-            Side::Ask => self.match_against_bids(order.id, order.price, &mut remaining),
+            Side::Bid => self.match_against_asks(order.id, order.price, &mut remaining, fills),
+            Side::Ask => self.match_against_bids(order.id, order.price, &mut remaining, fills),
         }
 
-        let status = if remaining == 0 {
+        if remaining == 0 {
             OrderStatus::Filled
         } else {
             self.place_resting(order.side, order.price, RestingOrder {
@@ -67,9 +87,7 @@ impl OrderBook {
             } else {
                 OrderStatus::Resting { remaining_qty: remaining }
             }
-        };
-
-        OrderResult { fills: self.fill_buf.drain(..).collect(), status }
+        }
     }
 
     /// Submit a market order. Returns fills. Unfilled remainder is cancelled.
@@ -77,24 +95,32 @@ impl OrderBook {
     /// # Panics
     /// Panics in debug mode if `qty == 0`.
     pub fn add_market_order(&mut self, order: MarketOrder) -> OrderResult {
+        let mut fills = Vec::new();
+        let status = self.add_market_order_into(order, &mut fills);
+        OrderResult { fills, status }
+    }
+
+    /// Submit a market order, appending its fills to `fills` instead of
+    /// allocating a result. The hot path of [`Self::add_market_order`].
+    ///
+    /// # Panics
+    /// Panics in debug mode if `qty == 0`.
+    pub fn add_market_order_into(&mut self, order: MarketOrder, fills: &mut Vec<Fill>) -> OrderStatus {
         debug_assert!(order.qty > 0, "market order qty must be > 0");
 
-        self.fill_buf.clear();
         let mut remaining = order.qty;
 
         match order.side {
-            Side::Bid => self.match_against_asks(order.id, i64::MAX, &mut remaining),
-            Side::Ask => self.match_against_bids(order.id, 0, &mut remaining),
+            Side::Bid => self.match_against_asks(order.id, i64::MAX, &mut remaining, fills),
+            Side::Ask => self.match_against_bids(order.id, 0, &mut remaining, fills),
         }
 
         let filled_qty = order.qty - remaining;
-        let status = if remaining == 0 {
+        if remaining == 0 {
             OrderStatus::Filled
         } else {
             OrderStatus::Cancelled { filled_qty }
-        };
-
-        OrderResult { fills: self.fill_buf.drain(..).collect(), status }
+        }
     }
 
     /// Cancel a resting order by ID. Returns `true` if the order was found and removed.
@@ -114,8 +140,14 @@ impl OrderBook {
             level.total_qty -= remaining_qty;
             // No live volume left: drop the level, discarding its tombstones.
             if level.total_qty == 0 {
-                book_side.remove(&price);
+                if let Some(mut level) = book_side.remove(&price) {
+                    level.orders.clear();
+                    self.level_pool.push(level.orders);
+                }
             }
+        }
+        if self.reaches_best(side, price) {
+            self.refresh_best(side);
         }
         true
     }
@@ -123,13 +155,50 @@ impl OrderBook {
     /// Best (highest) bid price, or `None` if the bid side is empty.
     #[must_use]
     pub fn best_bid(&self) -> Option<i64> {
-        self.bids.keys().next_back().copied()
+        self.best_bid_cache.map(|(price, _)| price)
     }
 
     /// Best (lowest) ask price, or `None` if the ask side is empty.
     #[must_use]
     pub fn best_ask(&self) -> Option<i64> {
-        self.asks.keys().next().copied()
+        self.best_ask_cache.map(|(price, _)| price)
+    }
+
+    /// Best bid as (price, live volume at that price), or `None` if the bid
+    /// side is empty. Reads the cache: no tree walk.
+    #[must_use]
+    pub fn best_bid_level(&self) -> Option<(i64, u64)> {
+        self.best_bid_cache
+    }
+
+    /// Best ask as (price, live volume at that price), or `None` if the ask
+    /// side is empty. Reads the cache: no tree walk.
+    #[must_use]
+    pub fn best_ask_level(&self) -> Option<(i64, u64)> {
+        self.best_ask_cache
+    }
+
+    /// Recompute one side's cache from its tree. Called only when a change
+    /// touches that side's best level.
+    fn refresh_best(&mut self, side: Side) {
+        match side {
+            Side::Bid => {
+                self.best_bid_cache =
+                    self.bids.last_key_value().map(|(&price, level)| (price, level.total_qty));
+            }
+            Side::Ask => {
+                self.best_ask_cache =
+                    self.asks.first_key_value().map(|(&price, level)| (price, level.total_qty));
+            }
+        }
+    }
+
+    /// True when `price` is at least as good as the side's cached best.
+    fn reaches_best(&self, side: Side, price: i64) -> bool {
+        match side {
+            Side::Bid => self.best_bid_cache.is_none_or(|(best, _)| price >= best),
+            Side::Ask => self.best_ask_cache.is_none_or(|(best, _)| price <= best),
+        }
     }
 
     /// Spread (best ask − best bid), or `None` if either side is empty.
@@ -157,24 +226,36 @@ impl OrderBook {
     // ── internal matching ──────────────────────────────────────────────
 
     /// Match an incoming bid against resting asks at prices ≤ `limit_price`.
-    fn match_against_asks(&mut self, taker_id: u64, limit_price: i64, remaining: &mut u64) {
+    fn match_against_asks(
+        &mut self,
+        taker_id: u64,
+        limit_price: i64,
+        remaining: &mut u64,
+        fills: &mut Vec<Fill>,
+    ) {
         while *remaining > 0 {
-            let Some((&ask_price, _)) = self.asks.first_key_value() else { break };
+            let Some((ask_price, _)) = self.best_ask_cache else { break };
             if ask_price > limit_price {
                 break;
             }
-            self.fill_at_level(Side::Bid, taker_id, ask_price, remaining);
+            self.fill_at_level(Side::Bid, taker_id, ask_price, remaining, fills);
         }
     }
 
     /// Match an incoming ask against resting bids at prices ≥ `limit_price`.
-    fn match_against_bids(&mut self, taker_id: u64, limit_price: i64, remaining: &mut u64) {
+    fn match_against_bids(
+        &mut self,
+        taker_id: u64,
+        limit_price: i64,
+        remaining: &mut u64,
+        fills: &mut Vec<Fill>,
+    ) {
         while *remaining > 0 {
-            let Some((&bid_price, _)) = self.bids.last_key_value() else { break };
+            let Some((bid_price, _)) = self.best_bid_cache else { break };
             if bid_price < limit_price {
                 break;
             }
-            self.fill_at_level(Side::Ask, taker_id, bid_price, remaining);
+            self.fill_at_level(Side::Ask, taker_id, bid_price, remaining, fills);
         }
     }
 
@@ -183,7 +264,7 @@ impl OrderBook {
     /// A queued order is a tombstone exactly when `orders` no longer holds it:
     /// a full fill drops it from the queue and from `orders` together, so a
     /// queue entry with no `orders` record can only have been cancelled.
-    fn drain_tombstones(level: &mut PriceLevel, orders: &HashMap<u64, (Side, i64, u64)>) {
+    fn drain_tombstones(level: &mut PriceLevel, orders: &FxHashMap<u64, (Side, i64, u64)>) {
         while let Some(front) = level.orders.front() {
             if orders.contains_key(&front.id) {
                 break;
@@ -194,7 +275,14 @@ impl OrderBook {
 
     /// Drain the front of the queue at `price` on the *opposite* side of `taker_side`,
     /// filling as much of `remaining` as possible. Removes the price level if fully consumed.
-    fn fill_at_level(&mut self, taker_side: Side, taker_id: u64, price: i64, remaining: &mut u64) {
+    fn fill_at_level(
+        &mut self,
+        taker_side: Side,
+        taker_id: u64,
+        price: i64,
+        remaining: &mut u64,
+        fills: &mut Vec<Fill>,
+    ) {
         let book_side = match taker_side {
             Side::Bid => &mut self.asks,
             Side::Ask => &mut self.bids,
@@ -207,7 +295,7 @@ impl OrderBook {
             let Some(front) = level.orders.front_mut() else { break };
             let fill_qty = (*remaining).min(front.qty);
 
-            self.fill_buf.push(Fill {
+            fills.push(Fill {
                 maker_order_id: front.id,
                 taker_order_id: taker_id,
                 price,
@@ -232,8 +320,14 @@ impl OrderBook {
         }
 
         if level.orders.is_empty() {
-            book_side.remove(&price);
+            if let Some(level) = book_side.remove(&price) {
+                self.level_pool.push(level.orders);
+            }
         }
+        self.refresh_best(match taker_side {
+            Side::Bid => Side::Ask,
+            Side::Ask => Side::Bid,
+        });
     }
 
     /// Insert a resting order into the appropriate side and register it in the lookup map.
@@ -244,11 +338,27 @@ impl OrderBook {
             Side::Ask => &mut self.asks,
         };
         let level = book_side.entry(price).or_insert_with(|| PriceLevel {
-            orders: VecDeque::new(),
+            orders: self.level_pool.pop().unwrap_or_default(),
             total_qty: 0,
         });
         level.total_qty += order.qty;
         level.orders.push_back(order);
+        let cache = match side {
+            Side::Bid => &mut self.best_bid_cache,
+            Side::Ask => &mut self.best_ask_cache,
+        };
+        let better = match (side, *cache) {
+            (_, None) => true,
+            (Side::Bid, Some((best, _))) => price > best,
+            (Side::Ask, Some((best, _))) => price < best,
+        };
+        if better {
+            *cache = Some((price, level.total_qty));
+        } else if let Some((best, volume)) = cache {
+            if *best == price {
+                *volume += order.qty;
+            }
+        }
     }
 }
 

@@ -1,6 +1,5 @@
-use std::collections::HashMap;
-
-use cda_engine::{LimitOrder, MarketOrder, OrderBook, OrderStatus, Side};
+use cda_engine::fasthash::FxHashMap;
+use cda_engine::{Fill, LimitOrder, MarketOrder, OrderBook, OrderStatus, Side};
 
 use crate::event::{ExchangeMessage, OrderAction};
 use crate::types::{AgentId, MarketSnapshot, Nanos, Symbol};
@@ -117,7 +116,7 @@ pub struct Exchange {
     book: OrderBook,
     is_open: bool,
     next_order_id: u64,
-    resting: HashMap<u64, OrderInfo>,
+    resting: FxHashMap<u64, OrderInfo>,
     last_trade_price: Option<i64>,
     last_trade_time: Option<Nanos>,
     /// Accumulated trade records (drained at end of simulation).
@@ -129,6 +128,8 @@ pub struct Exchange {
     keep_trades: bool,
     l1_bucket_ns: Option<Nanos>,
     open_bucket: Option<L1Bucket>,
+    /// Reusable fill buffer of [`Self::process_into`].
+    fill_buf: Vec<Fill>,
 }
 
 impl Exchange {
@@ -140,7 +141,7 @@ impl Exchange {
             book: OrderBook::new(),
             is_open: false,
             next_order_id: starting_order_id,
-            resting: HashMap::new(),
+            resting: FxHashMap::default(),
             last_trade_price: None,
             last_trade_time: None,
             trades: Vec::with_capacity(1 << 16),
@@ -149,6 +150,7 @@ impl Exchange {
             keep_trades: true,
             l1_bucket_ns: None,
             open_bucket: None,
+            fill_buf: Vec::new(),
         }
     }
 
@@ -175,8 +177,8 @@ impl Exchange {
     /// Current top-of-book snapshot.
     #[must_use]
     pub fn snapshot(&self) -> MarketSnapshot {
-        let best_bid = self.book.best_bid().map(|p| (p, self.book.volume_at(p, Side::Bid)));
-        let best_ask = self.book.best_ask().map(|p| (p, self.book.volume_at(p, Side::Ask)));
+        let best_bid = self.book.best_bid_level();
+        let best_ask = self.book.best_ask_level();
         MarketSnapshot {
             best_bid,
             best_ask,
@@ -238,18 +240,28 @@ impl Exchange {
             OrderAction::NewLimitOrder { side, price, qty, user_id } => {
                 let order = NewOrder { id: self.alloc_id(), user_id, side, qty };
                 self.push_accepted(agent_id, order, out);
-                let result = self.book.add_limit_order(LimitOrder {
-                    id: order.id, side, price, qty, timestamp: time,
-                });
-                self.record_fills(side, &result.fills, time, out);
-                self.notify_taker(agent_id, order, &result, out);
+                let mut fills = std::mem::take(&mut self.fill_buf);
+                fills.clear();
+                let status = self.book.add_limit_order_into(
+                    LimitOrder { id: order.id, side, price, qty, timestamp: time },
+                    &mut fills,
+                );
+                self.record_fills(side, &fills, time, out);
+                self.notify_taker(agent_id, order, status, &fills, out);
+                self.fill_buf = fills;
             }
             OrderAction::NewMarketOrder { side, qty, user_id } => {
                 let order = NewOrder { id: self.alloc_id(), user_id, side, qty };
                 self.push_accepted(agent_id, order, out);
-                let result = self.book.add_market_order(MarketOrder { id: order.id, side, qty });
-                self.record_fills(side, &result.fills, time, out);
-                self.notify_taker(agent_id, order, &result, out);
+                let mut fills = std::mem::take(&mut self.fill_buf);
+                fills.clear();
+                let status = self.book.add_market_order_into(
+                    MarketOrder { id: order.id, side, qty },
+                    &mut fills,
+                );
+                self.record_fills(side, &fills, time, out);
+                self.notify_taker(agent_id, order, status, &fills, out);
+                self.fill_buf = fills;
             }
             OrderAction::CancelOrder { order_id } => {
                 if self.book.cancel_order(order_id) {
@@ -363,13 +375,14 @@ impl Exchange {
         &mut self,
         taker: AgentId,
         order: NewOrder,
-        result: &cda_engine::OrderResult,
+        status: OrderStatus,
+        fills: &[Fill],
         out: &mut Vec<RoutedMessage>,
     ) {
-        let last_price = result.fills.last().map_or(0, |f| f.price);
-        match result.status {
+        let last_price = fills.last().map_or(0, |f| f.price);
+        match status {
             OrderStatus::Filled => {
-                let total: u64 = result.fills.iter().map(|f| f.qty).sum();
+                let total: u64 = fills.iter().map(|f| f.qty).sum();
                 out.push(RoutedMessage {
                     agent_id: taker,
                     message: ExchangeMessage::OrderFilled {
@@ -392,7 +405,7 @@ impl Exchange {
                 self.resting.insert(order.id, OrderInfo {
                     agent_id: taker, remaining_qty, user_id: order.user_id,
                 });
-                let filled: u64 = result.fills.iter().map(|f| f.qty).sum();
+                let filled: u64 = fills.iter().map(|f| f.qty).sum();
                 if filled > 0 {
                     out.push(RoutedMessage {
                         agent_id: taker,
@@ -436,10 +449,8 @@ impl Exchange {
     }
 
     fn record_l1(&mut self, time: Nanos) {
-        let bid_price = self.book.best_bid().unwrap_or(0);
-        let ask_price = self.book.best_ask().unwrap_or(0);
-        let bid_volume = self.book.best_bid().map_or(0, |p| self.book.volume_at(p, Side::Bid));
-        let ask_volume = self.book.best_ask().map_or(0, |p| self.book.volume_at(p, Side::Ask));
+        let (bid_price, bid_volume) = self.book.best_bid_level().unwrap_or((0, 0));
+        let (ask_price, ask_volume) = self.book.best_ask_level().unwrap_or((0, 0));
         if let Some(bucket_ns) = self.l1_bucket_ns {
             let bucket_start = time - time % bucket_ns;
             if self.open_bucket.map(|b| b.bucket_start) != Some(bucket_start) {

@@ -7,6 +7,7 @@
 //! with O(log N) placement and O(1) cancellation. Designed as the core matching
 //! engine for an agent-based market simulator.
 
+pub mod fasthash;
 mod fills;
 mod order;
 mod orderbook;
