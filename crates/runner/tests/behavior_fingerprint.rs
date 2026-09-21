@@ -117,7 +117,9 @@ impl Agent for ProbeAgent {
                 self.fold_in(qty);
                 self.open_orders.push(order_id);
             }
-            ExchangeMessage::OrderFilled { order_id, user_id, symbol, side, price, qty, remaining } => {
+            ExchangeMessage::OrderFilled {
+                order_id, user_id, symbol, side, price, qty, remaining, notional: _,
+            } => {
                 self.fold_in(2);
                 self.fold_in(order_id);
                 self.fold_in(user_id);
@@ -290,7 +292,7 @@ fn lean_bucket_run_keeps_its_fingerprint() {
     let got = run_fingerprint(
         LatencyModelType::NycSeattle { seed: 20260921 },
         true,
-        &RunOptions { keep_trades: false, l1_bucket_ns: Some(1_000_000_000) },
+        &RunOptions { keep_trades: false, l1_bucket_ns: Some(1_000_000_000), flow: None },
     );
     assert_eq!(got, 0xaa8d_4841_1311_7022, "fingerprint changed: {got:#018x}");
 }

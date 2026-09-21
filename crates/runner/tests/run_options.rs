@@ -147,7 +147,7 @@ fn bucket_aggregates_equal_a_reference_aggregation_of_the_full_log() {
 fn both_options_together() {
     let cfg = sim_config(7, vec![0]);
     let full = Kernel::run(&cfg, make_agents(&[0], 10, 7));
-    let options = RunOptions { keep_trades: false, l1_bucket_ns: Some(BUCKET_NS) };
+    let options = RunOptions { keep_trades: false, l1_bucket_ns: Some(BUCKET_NS), ..RunOptions::default() };
     let lean = Kernel::run_with(&cfg, make_agents(&[0], 10, 7), &options);
 
     assert!(lean.trades.is_empty());

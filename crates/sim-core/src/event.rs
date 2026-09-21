@@ -41,6 +41,7 @@ pub enum ExchangeMessage {
         price: i64,
         qty: u64,
         remaining: u64,
+        notional: u128,
     },
     OrderCancelled { order_id: u64, user_id: u64, symbol: Symbol },
     /// A rejected NEW order is reported with `order_id` 0 (no id is ever

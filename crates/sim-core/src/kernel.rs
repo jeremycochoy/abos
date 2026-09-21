@@ -4,7 +4,7 @@ use rand::SeedableRng;
 use crate::agent::{Agent, AgentAction};
 use crate::config::SimulationConfig;
 use crate::event::{EventPayload, ExchangeMessage, OrderAction};
-use crate::exchange::{Exchange, L1Bucket, L1Snapshot, RoutedMessage, TradeRecord};
+use crate::exchange::{Exchange, FlowBucket, FlowOptions, L1Bucket, L1Snapshot, RoutedMessage, TradeRecord};
 use crate::latency::LatencyModel;
 use crate::types::{MarketSnapshot, Nanos, Symbol};
 
@@ -14,6 +14,7 @@ pub struct SimulationResult {
     pub l1_snapshots: Vec<L1Snapshot>,
     /// L1 bucket aggregates. Empty unless [`RunOptions::l1_bucket_ns`] is set.
     pub l1_buckets: Vec<L1Bucket>,
+    pub flow_buckets: Vec<FlowBucket>,
     pub events_processed: u64,
     pub end_time: Nanos,
 }
@@ -32,11 +33,12 @@ pub struct RunOptions {
     /// nanoseconds. The aggregation discards the L1 detail below that
     /// scale. `None` keeps the full log.
     pub l1_bucket_ns: Option<Nanos>,
+    pub flow: Option<FlowOptions>,
 }
 
 impl Default for RunOptions {
     fn default() -> Self {
-        Self { keep_trades: true, l1_bucket_ns: None }
+        Self { keep_trades: true, l1_bucket_ns: None, flow: None }
     }
 }
 
@@ -195,9 +197,17 @@ impl Kernel {
         options: &RunOptions,
     ) -> SimulationResult {
         assert!(options.l1_bucket_ns != Some(0), "l1_bucket_ns must be positive");
+        if let Some(flow) = &options.flow {
+            assert!(flow.interval_ns > 0, "flow interval_ns must be positive");
+            assert!(
+                flow.ratio_edges.windows(2).all(|pair| pair[0] < pair[1]),
+                "flow ratio_edges must increase"
+            );
+        }
         let mut k = Self::init(config, agents.len());
         for ex in &mut k.exchanges {
             ex.set_run_options(options.keep_trades, options.l1_bucket_ns);
+            ex.set_flow_options(options.flow.clone());
         }
         k.schedule_lifecycle(config, agents.len());
         let (events_processed, current_time) = k.event_loop(config.end_time, &mut agents);
@@ -429,13 +439,19 @@ impl Kernel {
         for ex in &mut self.exchanges {
             ex.flush_l1_bucket();
         }
+        let configured_end = self.end_time;
+        let mut flow_buckets = Vec::new();
+        for ex in &mut self.exchanges {
+            flow_buckets.extend(ex.flush_flow(configured_end));
+        }
+        flow_buckets.sort_by_key(|bucket| bucket.start);
         let exchanges = &mut self.exchanges;
         let trades = merge_by_time(exchanges, |ex| std::mem::take(&mut ex.trades), |t| t.timestamp);
         let l1_snapshots =
             merge_by_time(exchanges, |ex| std::mem::take(&mut ex.l1_snapshots), |s| s.timestamp);
         let l1_buckets =
             merge_by_time(exchanges, |ex| std::mem::take(&mut ex.l1_buckets), |b| b.bucket_start);
-        SimulationResult { trades, l1_snapshots, l1_buckets, events_processed, end_time }
+        SimulationResult { trades, l1_snapshots, l1_buckets, flow_buckets, events_processed, end_time }
     }
 }
 

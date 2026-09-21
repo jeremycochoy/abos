@@ -223,6 +223,25 @@ impl OrderBook {
         self.orders.len()
     }
 
+    #[must_use]
+    pub fn executable_depth(&self, taker_side: Side, limit_price: Option<i64>) -> u64 {
+        match taker_side {
+            Side::Bid => self
+                .asks
+                .iter()
+                .take_while(|(&price, _)| limit_price.is_none_or(|limit| price <= limit))
+                .map(|(_, level)| level.total_qty)
+                .sum(),
+            Side::Ask => self
+                .bids
+                .iter()
+                .rev()
+                .take_while(|(&price, _)| limit_price.is_none_or(|limit| price >= limit))
+                .map(|(_, level)| level.total_qty)
+                .sum(),
+        }
+    }
+
     // ── internal matching ──────────────────────────────────────────────
 
     /// Match an incoming bid against resting asks at prices ≤ `limit_price`.

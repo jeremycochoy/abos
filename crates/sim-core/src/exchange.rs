@@ -1,4 +1,4 @@
-use cda_engine::fasthash::FxHashMap;
+use cda_engine::fasthash::{FxHashMap, FxHashSet};
 use cda_engine::{Fill, LimitOrder, MarketOrder, OrderBook, OrderStatus, Side};
 
 use crate::event::{ExchangeMessage, OrderAction};
@@ -94,6 +94,263 @@ pub struct RoutedMessage {
     pub message: ExchangeMessage,
 }
 
+#[derive(Debug, Clone)]
+pub struct FlowOptions {
+    pub agent_id: AgentId,
+    pub interval_ns: Nanos,
+    pub horizons_ns: Vec<Nanos>,
+    pub ratio_edges: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlowBucket {
+    pub start: Nanos,
+    pub symbol: Symbol,
+    pub market_trades: u64,
+    pub market_qty: u64,
+    pub market_notional: u128,
+    pub self_trades: u64,
+    pub self_qty: u64,
+    pub self_notional: u128,
+    pub taker_qty: u64,
+    pub taker_notional: u128,
+    pub maker_qty: u64,
+    pub maker_notional: u128,
+    pub orders: u64,
+    pub filled_orders: u64,
+    pub fill_events: u64,
+    pub submitted_qty: u64,
+    pub ratio_qty: Vec<u64>,
+    pub zero_depth_qty: u64,
+    pub shortfall: f64,
+    pub shortfall_base: u128,
+    pub response_num: Vec<f64>,
+    pub response_den: Vec<f64>,
+}
+
+impl FlowBucket {
+    fn new(start: Nanos, symbol: Symbol, bins: usize, horizons: usize) -> Self {
+        Self {
+            start,
+            symbol,
+            market_trades: 0,
+            market_qty: 0,
+            market_notional: 0,
+            self_trades: 0,
+            self_qty: 0,
+            self_notional: 0,
+            taker_qty: 0,
+            taker_notional: 0,
+            maker_qty: 0,
+            maker_notional: 0,
+            orders: 0,
+            filled_orders: 0,
+            fill_events: 0,
+            submitted_qty: 0,
+            ratio_qty: vec![0; bins],
+            zero_depth_qty: 0,
+            shortfall: 0.0,
+            shortfall_base: 0,
+            response_num: vec![0.0; horizons],
+            response_den: vec![0.0; horizons],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingResponse {
+    due: Nanos,
+    bucket: usize,
+    signed_notional: f64,
+    mid0: f64,
+}
+
+struct FlowRecorder {
+    options: FlowOptions,
+    symbol: Symbol,
+    buckets: Vec<FlowBucket>,
+    pending: Vec<std::collections::VecDeque<PendingResponse>>,
+    filled_ids: FxHashSet<u64>,
+    prevailing_mid: Option<f64>,
+}
+
+impl FlowRecorder {
+    fn new(options: FlowOptions, symbol: Symbol) -> Self {
+        let horizons = options.horizons_ns.len();
+        Self {
+            options,
+            symbol,
+            buckets: Vec::new(),
+            pending: vec![std::collections::VecDeque::new(); horizons],
+            filled_ids: FxHashSet::default(),
+            prevailing_mid: None,
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn bucket_index(&self, time: Nanos) -> usize {
+        (time / self.options.interval_ns) as usize
+    }
+
+    fn bucket_at(&mut self, index: usize) -> &mut FlowBucket {
+        let (bins, horizons) = (
+            self.options.ratio_edges.len() + 1,
+            self.options.horizons_ns.len(),
+        );
+        while self.buckets.len() <= index {
+            let start = self.buckets.len() as Nanos * self.options.interval_ns;
+            self.buckets
+                .push(FlowBucket::new(start, self.symbol, bins, horizons));
+        }
+        &mut self.buckets[index]
+    }
+
+    fn on_new_order(&mut self, time: Nanos, agent_id: AgentId, qty: u64, depth: u64) {
+        if agent_id != self.options.agent_id {
+            return;
+        }
+        let index = self.bucket_index(time);
+        let edges_below = if depth > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            let ratio = qty as f64 / depth as f64;
+            Some(self.options.ratio_edges.partition_point(|&edge| edge <= ratio))
+        } else {
+            None
+        };
+        let bucket = self.bucket_at(index);
+        bucket.orders += 1;
+        bucket.submitted_qty += qty;
+        match edges_below {
+            Some(bin) => bucket.ratio_qty[bin] += qty,
+            None => bucket.zero_depth_qty += qty,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_fill(
+        &mut self,
+        time: Nanos,
+        taker_agent: AgentId,
+        taker_order_id: u64,
+        maker_agent: Option<AgentId>,
+        maker_order_id: u64,
+        taker_side: Side,
+        price: i64,
+        qty: u64,
+        mid0: Option<f64>,
+    ) {
+        let watched = self.options.agent_id;
+        let notional = u128::from(price.unsigned_abs()) * u128::from(qty);
+        let taker_is_watched = taker_agent == watched;
+        let maker_is_watched = maker_agent == Some(watched);
+        let index = self.bucket_index(time);
+        if taker_is_watched || maker_is_watched {
+            let mut first_fills = 0;
+            if taker_is_watched && self.filled_ids.insert(taker_order_id) {
+                first_fills += 1;
+            }
+            if maker_is_watched && self.filled_ids.insert(maker_order_id) {
+                first_fills += 1;
+            }
+            let bucket = self.bucket_at(index);
+            bucket.fill_events += 1;
+            bucket.filled_orders += first_fills;
+        }
+        if taker_is_watched && maker_is_watched {
+            let bucket = self.bucket_at(index);
+            bucket.self_trades += 1;
+            bucket.self_qty += qty;
+            bucket.self_notional += notional;
+            return;
+        }
+        {
+            let bucket = self.bucket_at(index);
+            bucket.market_trades += 1;
+            bucket.market_qty += qty;
+            bucket.market_notional += notional;
+        }
+        if !taker_is_watched && !maker_is_watched {
+            return;
+        }
+        let side = if taker_is_watched {
+            taker_side
+        } else {
+            match taker_side {
+                Side::Bid => Side::Ask,
+                Side::Ask => Side::Bid,
+            }
+        };
+        let sign = match side {
+            Side::Bid => 1.0,
+            Side::Ask => -1.0,
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let notional_f64 = notional as f64;
+        let bucket = self.bucket_at(index);
+        if taker_is_watched {
+            bucket.taker_qty += qty;
+            bucket.taker_notional += notional;
+            if let Some(mid0) = mid0 {
+                #[allow(clippy::cast_precision_loss)]
+                let cost = sign * (price as f64 - mid0) / mid0;
+                bucket.shortfall += cost * notional_f64;
+                bucket.shortfall_base += notional;
+            }
+        } else {
+            bucket.maker_qty += qty;
+            bucket.maker_notional += notional;
+        }
+        if let Some(mid0) = mid0 {
+            for (horizon, &delay) in self.options.horizons_ns.iter().enumerate() {
+                self.pending[horizon].push_back(PendingResponse {
+                    due: time + delay,
+                    bucket: index,
+                    signed_notional: sign * notional_f64,
+                    mid0,
+                });
+            }
+        }
+    }
+
+    fn on_order_gone(&mut self, order_id: u64) {
+        self.filled_ids.remove(&order_id);
+    }
+
+    fn resolve_due(&mut self, before: Nanos) {
+        let mid = self.prevailing_mid;
+        for horizon in 0..self.pending.len() {
+            while let Some(&entry) = self.pending[horizon].front() {
+                if entry.due >= before {
+                    break;
+                }
+                self.pending[horizon].pop_front();
+                if let Some(mid) = mid {
+                    let bucket = &mut self.buckets[entry.bucket];
+                    bucket.response_num[horizon] +=
+                        entry.signed_notional * (mid - entry.mid0) / entry.mid0;
+                    bucket.response_den[horizon] += entry.signed_notional.abs();
+                }
+            }
+        }
+    }
+
+    fn on_quote(&mut self, time: Nanos, bid_price: i64, ask_price: i64) {
+        if bid_price > 0 && ask_price > 0 {
+            self.resolve_due(time);
+            #[allow(clippy::cast_precision_loss)]
+            let mid = (bid_price as f64 + ask_price as f64) / 2.0;
+            self.prevailing_mid = Some(mid);
+        }
+    }
+
+    fn flush(&mut self, end_time: Nanos) -> Vec<FlowBucket> {
+        self.resolve_due(end_time.saturating_add(1));
+        let last_index = self.bucket_index(end_time.saturating_sub(1));
+        self.bucket_at(last_index);
+        std::mem::take(&mut self.buckets)
+    }
+}
+
 /// Identity of a just-created order, as echoed to its owner.
 #[derive(Clone, Copy)]
 struct NewOrder {
@@ -128,6 +385,7 @@ pub struct Exchange {
     keep_trades: bool,
     l1_bucket_ns: Option<Nanos>,
     open_bucket: Option<L1Bucket>,
+    flow: Option<FlowRecorder>,
     /// Reusable fill buffer of [`Self::process_into`].
     fill_buf: Vec<Fill>,
 }
@@ -150,6 +408,7 @@ impl Exchange {
             keep_trades: true,
             l1_bucket_ns: None,
             open_bucket: None,
+            flow: None,
             fill_buf: Vec::new(),
         }
     }
@@ -159,6 +418,17 @@ impl Exchange {
     pub fn set_run_options(&mut self, keep_trades: bool, l1_bucket_ns: Option<Nanos>) {
         self.keep_trades = keep_trades;
         self.l1_bucket_ns = l1_bucket_ns;
+    }
+
+    pub fn set_flow_options(&mut self, options: Option<FlowOptions>) {
+        self.flow = options.map(|options| FlowRecorder::new(options, self.sym));
+    }
+
+    #[must_use]
+    pub fn flush_flow(&mut self, end_time: Nanos) -> Vec<FlowBucket> {
+        self.flow
+            .as_mut()
+            .map_or_else(Vec::new, |flow| flow.flush(end_time))
     }
 
     /// Push the open bucket, if any, into `l1_buckets`.
@@ -198,6 +468,9 @@ impl Exchange {
         self.is_open = false;
         for (&oid, info) in &self.resting {
             self.book.cancel_order(oid);
+            if let Some(flow) = self.flow.as_mut() {
+                flow.on_order_gone(oid);
+            }
             out.push(RoutedMessage {
                 agent_id: info.agent_id,
                 message: ExchangeMessage::OrderCancelled {
@@ -235,10 +508,16 @@ impl Exchange {
         }
 
         let bbo_before = (self.book.best_bid(), self.book.best_ask());
+        let mid0 = match bbo_before {
+            #[allow(clippy::cast_precision_loss)]
+            (Some(bid), Some(ask)) => Some((bid as f64 + ask as f64) / 2.0),
+            _ => None,
+        };
 
         match action {
             OrderAction::NewLimitOrder { side, price, qty, user_id } => {
                 let order = NewOrder { id: self.alloc_id(), user_id, side, qty };
+                self.record_submission(agent_id, time, side, Some(price), qty);
                 self.push_accepted(agent_id, order, out);
                 let mut fills = std::mem::take(&mut self.fill_buf);
                 fills.clear();
@@ -246,12 +525,13 @@ impl Exchange {
                     LimitOrder { id: order.id, side, price, qty, timestamp: time },
                     &mut fills,
                 );
-                self.record_fills(side, &fills, time, out);
+                self.record_fills(agent_id, side, &fills, time, mid0, out);
                 self.notify_taker(agent_id, order, status, &fills, out);
                 self.fill_buf = fills;
             }
             OrderAction::NewMarketOrder { side, qty, user_id } => {
                 let order = NewOrder { id: self.alloc_id(), user_id, side, qty };
+                self.record_submission(agent_id, time, side, None, qty);
                 self.push_accepted(agent_id, order, out);
                 let mut fills = std::mem::take(&mut self.fill_buf);
                 fills.clear();
@@ -259,13 +539,16 @@ impl Exchange {
                     MarketOrder { id: order.id, side, qty },
                     &mut fills,
                 );
-                self.record_fills(side, &fills, time, out);
+                self.record_fills(agent_id, side, &fills, time, mid0, out);
                 self.notify_taker(agent_id, order, status, &fills, out);
                 self.fill_buf = fills;
             }
             OrderAction::CancelOrder { order_id } => {
                 if self.book.cancel_order(order_id) {
                     let user_id = self.resting.remove(&order_id).map_or(0, |info| info.user_id);
+                    if let Some(flow) = self.flow.as_mut() {
+                        flow.on_order_gone(order_id);
+                    }
                     out.push(RoutedMessage {
                         agent_id,
                         message: ExchangeMessage::OrderCancelled {
@@ -323,11 +606,29 @@ impl Exchange {
         });
     }
 
+    fn record_submission(
+        &mut self,
+        agent_id: AgentId,
+        time: Nanos,
+        side: Side,
+        limit_price: Option<i64>,
+        qty: u64,
+    ) {
+        let Some(flow) = self.flow.as_mut() else { return };
+        if agent_id != flow.options.agent_id {
+            return;
+        }
+        let depth = self.book.executable_depth(side, limit_price);
+        flow.on_new_order(time, agent_id, qty, depth);
+    }
+
     fn record_fills(
         &mut self,
+        taker: AgentId,
         taker_side: Side,
         fills: &[cda_engine::Fill],
         time: Nanos,
+        mid0: Option<f64>,
         out: &mut Vec<RoutedMessage>,
     ) {
         let maker_side = match taker_side {
@@ -337,6 +638,21 @@ impl Exchange {
         for fill in fills {
             self.last_trade_price = Some(fill.price);
             self.last_trade_time = Some(time);
+
+            if let Some(flow) = self.flow.as_mut() {
+                let maker_agent = self.resting.get(&fill.maker_order_id).map(|info| info.agent_id);
+                flow.on_fill(
+                    time,
+                    taker,
+                    fill.taker_order_id,
+                    maker_agent,
+                    fill.maker_order_id,
+                    taker_side,
+                    fill.price,
+                    fill.qty,
+                    mid0,
+                );
+            }
 
             if self.keep_trades {
                 self.trades.push(TradeRecord {
@@ -362,10 +678,14 @@ impl Exchange {
                         price: fill.price,
                         qty: fill.qty,
                         remaining: info.remaining_qty,
+                        notional: fill_notional(fill),
                     },
                 });
                 if info.remaining_qty == 0 {
                     self.resting.remove(&fill.maker_order_id);
+                    if let Some(flow) = self.flow.as_mut() {
+                        flow.on_order_gone(fill.maker_order_id);
+                    }
                 }
             }
         }
@@ -380,6 +700,12 @@ impl Exchange {
         out: &mut Vec<RoutedMessage>,
     ) {
         let last_price = fills.last().map_or(0, |f| f.price);
+        let notional: u128 = fills.iter().map(fill_notional).sum();
+        if matches!(status, OrderStatus::Filled | OrderStatus::Cancelled { .. }) {
+            if let Some(flow) = self.flow.as_mut() {
+                flow.on_order_gone(order.id);
+            }
+        }
         match status {
             OrderStatus::Filled => {
                 let total: u64 = fills.iter().map(|f| f.qty).sum();
@@ -393,6 +719,7 @@ impl Exchange {
                         price: last_price,
                         qty: total,
                         remaining: 0,
+                        notional,
                     },
                 });
             }
@@ -417,6 +744,7 @@ impl Exchange {
                             price: last_price,
                             qty: filled,
                             remaining: remaining_qty,
+                            notional,
                         },
                     });
                 }
@@ -433,6 +761,7 @@ impl Exchange {
                             price: last_price,
                             qty: filled_qty,
                             remaining: order.qty - filled_qty,
+                            notional,
                         },
                     });
                 }
@@ -451,6 +780,9 @@ impl Exchange {
     fn record_l1(&mut self, time: Nanos) {
         let (bid_price, bid_volume) = self.book.best_bid_level().unwrap_or((0, 0));
         let (ask_price, ask_volume) = self.book.best_ask_level().unwrap_or((0, 0));
+        if let Some(flow) = self.flow.as_mut() {
+            flow.on_quote(time, bid_price, ask_price);
+        }
         if let Some(bucket_ns) = self.l1_bucket_ns {
             let bucket_start = time - time % bucket_ns;
             if self.open_bucket.map(|b| b.bucket_start) != Some(bucket_start) {
@@ -472,6 +804,10 @@ impl Exchange {
             last_trade_price: self.last_trade_price.unwrap_or(0),
         });
     }
+}
+
+fn fill_notional(fill: &Fill) -> u128 {
+    u128::from(fill.price.unsigned_abs()) * u128::from(fill.qty)
 }
 
 #[cfg(test)]
