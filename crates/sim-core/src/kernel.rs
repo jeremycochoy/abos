@@ -6,7 +6,7 @@ use rand::SeedableRng;
 use crate::agent::{Agent, AgentAction};
 use crate::config::SimulationConfig;
 use crate::event::{Event, EventPayload, OrderAction};
-use crate::exchange::{Exchange, L1Snapshot, RoutedMessage, TradeRecord};
+use crate::exchange::{Exchange, L1Bucket, L1Snapshot, RoutedMessage, TradeRecord};
 use crate::latency::LatencyModel;
 use crate::types::{MarketSnapshot, Nanos, Symbol};
 
@@ -14,8 +14,32 @@ use crate::types::{MarketSnapshot, Nanos, Symbol};
 pub struct SimulationResult {
     pub trades: Vec<TradeRecord>,
     pub l1_snapshots: Vec<L1Snapshot>,
+    /// L1 bucket aggregates. Empty unless [`RunOptions::l1_bucket_ns`] is set.
+    pub l1_buckets: Vec<L1Bucket>,
     pub events_processed: u64,
     pub end_time: Nanos,
+}
+
+/// Opt-in output reduction of one run (issue #8).
+///
+/// The default keeps the behavior of [`Kernel::run`]: every trade and every
+/// L1 snapshot stays in memory, ready for export. Each option trades data
+/// for memory, so a run that needs the full log must not set it.
+#[derive(Debug, Clone)]
+pub struct RunOptions {
+    /// Keep every trade in [`SimulationResult::trades`]. `false` drops the
+    /// trade log and bounds that part of the memory.
+    pub keep_trades: bool,
+    /// Replace the per-event L1 log with one [`L1Bucket`] per this many
+    /// nanoseconds. The aggregation discards the L1 detail below that
+    /// scale. `None` keeps the full log.
+    pub l1_bucket_ns: Option<Nanos>,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self { keep_trades: true, l1_bucket_ns: None }
+    }
 }
 
 /// Discrete-event simulation kernel.
@@ -33,13 +57,31 @@ pub struct Kernel {
 }
 
 impl Kernel {
-    /// Run the simulation to completion.
+    /// Run the simulation to completion, with the default output: every
+    /// trade and every L1 snapshot stays in memory.
     #[must_use]
     pub fn run(
         config: &SimulationConfig,
-        mut agents: Vec<Box<dyn Agent>>,
+        agents: Vec<Box<dyn Agent>>,
     ) -> SimulationResult {
+        Self::run_with(config, agents, &RunOptions::default())
+    }
+
+    /// Run the simulation to completion, with explicit output options.
+    ///
+    /// # Panics
+    /// Panics when `options.l1_bucket_ns` is `Some(0)`.
+    #[must_use]
+    pub fn run_with(
+        config: &SimulationConfig,
+        mut agents: Vec<Box<dyn Agent>>,
+        options: &RunOptions,
+    ) -> SimulationResult {
+        assert!(options.l1_bucket_ns != Some(0), "l1_bucket_ns must be positive");
         let mut k = Self::init(config, agents.len());
+        for ex in &mut k.exchanges {
+            ex.set_run_options(options.keep_trades, options.l1_bucket_ns);
+        }
         k.schedule_lifecycle(config, agents.len());
         let (events_processed, current_time) = k.event_loop(config.end_time, &mut agents);
         k.collect_results(events_processed, current_time)
@@ -207,12 +249,16 @@ impl Kernel {
     ) -> SimulationResult {
         let mut trades = Vec::new();
         let mut l1_snapshots = Vec::new();
+        let mut l1_buckets = Vec::new();
         for ex in &mut self.exchanges {
+            ex.flush_l1_bucket();
             trades.append(&mut ex.trades);
             l1_snapshots.append(&mut ex.l1_snapshots);
+            l1_buckets.append(&mut ex.l1_buckets);
         }
         trades.sort_by_key(|t| t.timestamp);
         l1_snapshots.sort_by_key(|s| s.timestamp);
-        SimulationResult { trades, l1_snapshots, events_processed, end_time }
+        l1_buckets.sort_by_key(|b| b.bucket_start);
+        SimulationResult { trades, l1_snapshots, l1_buckets, events_processed, end_time }
     }
 }

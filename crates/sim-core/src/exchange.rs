@@ -29,6 +29,65 @@ pub struct L1Snapshot {
     pub last_trade_price: i64,
 }
 
+/// One k-nanosecond aggregate of the L1 log (issue #8).
+///
+/// The price fields read the quoted snapshots only, the snapshots with both
+/// sides present; `0` means the bucket saw no quote yet. `volume` and
+/// `quote_volume` sum over every snapshot of the bucket, exactly as the
+/// kline export sums the full log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L1Bucket {
+    pub bucket_start: Nanos,
+    pub symbol: Symbol,
+    pub first_bid: i64,
+    pub min_bid: i64,
+    pub last_bid: i64,
+    pub first_ask: i64,
+    pub max_ask: i64,
+    pub last_ask: i64,
+    pub volume: u64,
+    pub quote_volume: u128,
+}
+
+impl L1Bucket {
+    /// An empty bucket.
+    #[must_use]
+    pub fn new(bucket_start: Nanos, symbol: Symbol) -> Self {
+        Self {
+            bucket_start,
+            symbol,
+            first_bid: 0,
+            min_bid: 0,
+            last_bid: 0,
+            first_ask: 0,
+            max_ask: 0,
+            last_ask: 0,
+            volume: 0,
+            quote_volume: 0,
+        }
+    }
+
+    /// Fold one L1 state into the bucket.
+    pub fn absorb(&mut self, bid_price: i64, ask_price: i64, bid_volume: u64, ask_volume: u64) {
+        if bid_price > 0 && ask_price > 0 {
+            if self.last_bid == 0 {
+                self.first_bid = bid_price;
+                self.min_bid = bid_price;
+                self.first_ask = ask_price;
+                self.max_ask = ask_price;
+            }
+            self.min_bid = self.min_bid.min(bid_price);
+            self.max_ask = self.max_ask.max(ask_price);
+            self.last_bid = bid_price;
+            self.last_ask = ask_price;
+        }
+        self.volume += bid_volume + ask_volume;
+        self.quote_volume += u128::try_from(bid_price.max(0)).unwrap_or(0)
+            * u128::from(bid_volume)
+            + u128::try_from(ask_price.max(0)).unwrap_or(0) * u128::from(ask_volume);
+    }
+}
+
 /// A message routed to a specific agent.
 #[derive(Debug, Clone, Copy)]
 pub struct RoutedMessage {
@@ -65,6 +124,11 @@ pub struct Exchange {
     pub trades: Vec<TradeRecord>,
     /// Accumulated L1 snapshots (drained at end of simulation).
     pub l1_snapshots: Vec<L1Snapshot>,
+    /// Accumulated L1 buckets (drained at end of simulation; bucket mode only).
+    pub l1_buckets: Vec<L1Bucket>,
+    keep_trades: bool,
+    l1_bucket_ns: Option<Nanos>,
+    open_bucket: Option<L1Bucket>,
 }
 
 impl Exchange {
@@ -81,6 +145,24 @@ impl Exchange {
             last_trade_time: None,
             trades: Vec::with_capacity(1 << 16),
             l1_snapshots: Vec::with_capacity(1 << 16),
+            l1_buckets: Vec::new(),
+            keep_trades: true,
+            l1_bucket_ns: None,
+            open_bucket: None,
+        }
+    }
+
+    /// Select the output of the run. The defaults keep every trade and the
+    /// per-event L1 log, as [`crate::kernel::RunOptions`] documents.
+    pub fn set_run_options(&mut self, keep_trades: bool, l1_bucket_ns: Option<Nanos>) {
+        self.keep_trades = keep_trades;
+        self.l1_bucket_ns = l1_bucket_ns;
+    }
+
+    /// Push the open bucket, if any, into `l1_buckets`.
+    pub fn flush_l1_bucket(&mut self) {
+        if let Some(done) = self.open_bucket.take() {
+            self.l1_buckets.push(done);
         }
     }
 
@@ -244,15 +326,17 @@ impl Exchange {
             self.last_trade_price = Some(fill.price);
             self.last_trade_time = Some(time);
 
-            self.trades.push(TradeRecord {
-                timestamp: time,
-                symbol: self.sym,
-                price: fill.price,
-                qty: fill.qty,
-                aggressor_side: taker_side,
-                maker_order_id: fill.maker_order_id,
-                taker_order_id: fill.taker_order_id,
-            });
+            if self.keep_trades {
+                self.trades.push(TradeRecord {
+                    timestamp: time,
+                    symbol: self.sym,
+                    price: fill.price,
+                    qty: fill.qty,
+                    aggressor_side: taker_side,
+                    maker_order_id: fill.maker_order_id,
+                    taker_order_id: fill.taker_order_id,
+                });
+            }
 
             if let Some(info) = self.resting.get_mut(&fill.maker_order_id) {
                 info.remaining_qty = info.remaining_qty.saturating_sub(fill.qty);
@@ -356,6 +440,17 @@ impl Exchange {
         let ask_price = self.book.best_ask().unwrap_or(0);
         let bid_volume = self.book.best_bid().map_or(0, |p| self.book.volume_at(p, Side::Bid));
         let ask_volume = self.book.best_ask().map_or(0, |p| self.book.volume_at(p, Side::Ask));
+        if let Some(bucket_ns) = self.l1_bucket_ns {
+            let bucket_start = time - time % bucket_ns;
+            if self.open_bucket.map(|b| b.bucket_start) != Some(bucket_start) {
+                self.flush_l1_bucket();
+                self.open_bucket = Some(L1Bucket::new(bucket_start, self.sym));
+            }
+            if let Some(bucket) = self.open_bucket.as_mut() {
+                bucket.absorb(bid_price, ask_price, bid_volume, ask_volume);
+            }
+            return;
+        }
         self.l1_snapshots.push(L1Snapshot {
             timestamp: time,
             symbol: self.sym,
