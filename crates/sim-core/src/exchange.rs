@@ -81,8 +81,7 @@ impl L1Bucket {
             self.last_ask = ask_price;
         }
         self.volume += bid_volume + ask_volume;
-        self.quote_volume += u128::try_from(bid_price.max(0)).unwrap_or(0)
-            * u128::from(bid_volume)
+        self.quote_volume += u128::try_from(bid_price.max(0)).unwrap_or(0) * u128::from(bid_volume)
             + u128::try_from(ask_price.max(0)).unwrap_or(0) * u128::from(ask_volume);
     }
 }
@@ -94,52 +93,114 @@ pub struct RoutedMessage {
     pub message: ExchangeMessage,
 }
 
+/// Interval diagnostics for one agent on each exchange.
+///
+/// Quantities use lots. Notionals use tick-lots. Times use simulation nanoseconds.
+/// Configure this before the first order. The interval must be positive.
 #[derive(Debug, Clone)]
 pub struct FlowOptions {
+    /// Agent whose external fills and submitted orders the recorder tracks.
     pub agent_id: AgentId,
+    /// Width of intervals aligned to simulation time zero, in nanoseconds.
     pub interval_ns: Nanos,
+    /// Price-response delays, in nanoseconds. Their order defines all response vectors.
     pub horizons_ns: Vec<Nanos>,
+    /// Increasing boundaries for dimensionless submitted-notional/depth ratios.
+    /// Bins are `[0, e0)`, `[e0, e1)`, ..., `[e_last, infinity)`.
     pub ratio_edges: Vec<f64>,
 }
 
+/// Flow on one symbol in one interval, with separate external and self matches.
+///
+/// Each external market match counts once. Maker and taker subsets contain only
+/// the watched agent's external fills. Self matches never enter cost or response support.
+/// Quantities use lots. Notionals and weighted numerators use tick-lots.
+/// Divide a numerator by its matching eligible base. An empty base gives no estimate.
+///
+/// Shortfall is `s * (price / pre_trade_mid - 1)`, with `s = +1` for buys and `-1` for sells.
+/// Response is `s * (mid_at_horizon / pre_trade_mid - 1)`.
+/// A valid mid is positive and two-sided. Response vectors follow [`FlowOptions::horizons_ns`].
+/// Responses use the book after all quote changes at the horizon, in event order.
+/// Missing mids and horizons past the run end enter excluded support.
+///
+/// An order can be eligible or filled in several intervals. Use [`FlowTotals`] for distinct run totals.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlowBucket {
+    /// Inclusive interval start in simulation nanoseconds.
     pub start: Nanos,
+    /// Exchange symbol.
     pub symbol: Symbol,
+    /// External matches across all agents, once per match.
     pub market_trades: u64,
+    /// External matched quantity across all agents, in lots.
     pub market_qty: u64,
+    /// External matched notional across all agents, in tick-lots.
     pub market_notional: u128,
+    /// Same-owner matches across all agents, once per match.
     pub market_self_trades: u64,
+    /// Same-owner matched quantity across all agents, in lots.
     pub market_self_qty: u64,
+    /// Same-owner matched notional across all agents, once per match.
     pub market_self_notional: u128,
+    /// Same-owner matches of the watched agent, once per match.
     pub self_trades: u64,
+    /// Same-owner matched quantity of the watched agent, in lots.
     pub self_qty: u64,
+    /// Same-owner matched notional of the watched agent, once per match.
     pub self_notional: u128,
+    /// Watched taker quantity against other owners, in lots.
     pub taker_qty: u64,
+    /// Watched taker notional against other owners, in tick-lots.
     pub taker_notional: u128,
+    /// Watched maker quantity against other owners, in lots.
     pub maker_qty: u64,
+    /// Watched maker notional against other owners, in tick-lots.
     pub maker_notional: u128,
+    /// Watched orders accepted at exchange arrival during this interval.
     pub orders: u64,
+    /// Watched new orders rejected at exchange arrival during this interval.
     pub rejected_orders: u64,
+    /// Distinct accepted orders carried into or accepted during this interval.
     pub eligible_orders: u64,
+    /// Distinct eligible orders with an external fill during this interval.
     pub filled_orders: u64,
+    /// External matches that fill a watched order, including repeated partial fills.
     pub fill_events: u64,
+    /// Accepted watched order quantity during this interval, in lots.
     pub submitted_qty: u64,
+    /// Submitted notional per finite depth-ratio bin, in tick-lots.
+    /// Limits use limit price times quantity. Market orders use the pre-submit mid.
+    /// Depth includes all live opposing displayed orders through the limit, including own orders.
     pub ratio_notional: Vec<f64>,
+    /// Accepted order count per finite depth-ratio bin.
     pub ratio_count: Vec<u64>,
+    /// Orders with zero executable depth or no market-order valuation mid.
     pub zero_depth_count: u64,
+    /// Quantity of those unsupported orders, in lots.
     pub zero_depth_qty: u64,
+    /// Valued notional of those unsupported orders. Missing valuations contribute zero.
     pub zero_depth_notional: f64,
+    /// Sum of external taker notional times signed shortfall.
     pub shortfall_taker: f64,
+    /// External taker notional with a valid pre-trade mid.
     pub shortfall_taker_base: u128,
+    /// Sum of external maker notional times signed shortfall.
     pub shortfall_maker: f64,
+    /// External maker notional with a valid pre-trade mid.
     pub shortfall_maker_base: u128,
+    /// External watched fills without a valid pre-trade mid.
     pub shortfall_excluded_count: u64,
+    /// External watched notional without a valid pre-trade mid.
     pub shortfall_excluded_notional: u128,
+    /// Sum of eligible fill notional times signed response, by horizon and original fill interval.
     pub response_num: Vec<f64>,
+    /// Eligible external fill notional at each horizon.
     pub response_den: Vec<f64>,
+    /// Eligible external fill count at each horizon.
     pub response_count: Vec<u64>,
+    /// External fill notional without both valid mids or a completed horizon.
     pub response_excluded_notional: Vec<f64>,
+    /// External fill count without both valid mids or a completed horizon.
     pub response_excluded_count: Vec<u64>,
 }
 
@@ -187,12 +248,21 @@ impl FlowBucket {
     }
 }
 
+/// Distinct watched-order totals for one symbol over the whole rollout.
+///
+/// `filled_orders / accepted_orders` is the rollout fill rate when the denominator is positive.
+/// Interval cohort counts can repeat orders, so their sums cannot replace these totals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlowTotals {
+    /// Exchange symbol.
     pub symbol: Symbol,
+    /// Distinct watched orders accepted during the run.
     pub accepted_orders: u64,
+    /// Watched new orders rejected during the run.
     pub rejected_orders: u64,
+    /// Distinct watched orders with at least one external fill.
     pub filled_orders: u64,
+    /// External matches that fill a watched order.
     pub fill_events: u64,
 }
 
@@ -204,6 +274,8 @@ struct PendingResponse {
     mid0: f64,
 }
 
+/// Aggregate matches online and retain pending responses until each horizon resolves.
+/// Keep live and filled order identities to form interval cohorts and distinct run totals.
 struct FlowRecorder {
     options: FlowOptions,
     symbol: Symbol,
@@ -292,7 +364,13 @@ impl FlowRecorder {
         self.totals.rejected_orders += 1;
     }
 
-    fn on_depth(&mut self, time: Nanos, qty: u64, order_notional: Option<f64>, depth_notional: u128) {
+    fn on_depth(
+        &mut self,
+        time: Nanos,
+        qty: u64,
+        order_notional: Option<f64>,
+        depth_notional: u128,
+    ) {
         let index = self.bucket_index(time);
         self.roll_to(index);
         #[allow(clippy::cast_precision_loss)]
@@ -300,7 +378,9 @@ impl FlowRecorder {
             .filter(|_| depth_notional > 0)
             .map(|notional| {
                 let ratio = notional / depth_notional as f64;
-                self.options.ratio_edges.partition_point(|&edge| edge <= ratio)
+                self.options
+                    .ratio_edges
+                    .partition_point(|&edge| edge <= ratio)
             });
         let bucket = self.bucket_at(index);
         if let Some(bin) = edges_below {
@@ -354,7 +434,11 @@ impl FlowRecorder {
         if !taker_is_watched && !maker_is_watched {
             return;
         }
-        let order_id = if maker_is_watched { maker_order_id } else { taker_order_id };
+        let order_id = if maker_is_watched {
+            maker_order_id
+        } else {
+            taker_order_id
+        };
         let newly_filled_here = self.filled_in_interval.insert(order_id);
         let newly_filled_ever = self.ever_filled.insert(order_id);
         self.totals.fill_events += 1;
@@ -543,10 +627,13 @@ impl Exchange {
         self.l1_bucket_ns = l1_bucket_ns;
     }
 
+    /// Set diagnostics before trading. This discards any previous recorder and its data.
     pub fn set_flow_options(&mut self, options: Option<FlowOptions>) {
         self.flow = options.map(|options| FlowRecorder::new(options, self.sym));
     }
 
+    /// Resolve responses through `end_time`, exclude later horizons, and drain the interval rows.
+    /// Call once after the last event. `None` means flow recording was disabled.
     #[must_use]
     pub fn flush_flow(&mut self, end_time: Nanos) -> Option<(Vec<FlowBucket>, FlowTotals)> {
         self.flow.as_mut().map(|flow| flow.flush(end_time))
@@ -606,6 +693,7 @@ impl Exchange {
     }
 
     /// Process an order action from an agent. Writes messages into `out`.
+    #[allow(clippy::too_many_lines)]
     pub fn process_into(
         &mut self,
         agent_id: AgentId,
@@ -628,7 +716,11 @@ impl Exchange {
             }
             out.push(RoutedMessage {
                 agent_id,
-                message: ExchangeMessage::OrderRejected { order_id, user_id, symbol: self.sym },
+                message: ExchangeMessage::OrderRejected {
+                    order_id,
+                    user_id,
+                    symbol: self.sym,
+                },
             });
             return;
         }
@@ -643,14 +735,30 @@ impl Exchange {
         };
 
         match action {
-            OrderAction::NewLimitOrder { side, price, qty, user_id } => {
-                let order = NewOrder { id: self.alloc_id(), user_id, side, qty };
+            OrderAction::NewLimitOrder {
+                side,
+                price,
+                qty,
+                user_id,
+            } => {
+                let order = NewOrder {
+                    id: self.alloc_id(),
+                    user_id,
+                    side,
+                    qty,
+                };
                 self.record_submission(agent_id, time, side, Some(price), qty, order.id, mid0);
                 self.push_accepted(agent_id, order, out);
                 let mut fills = std::mem::take(&mut self.fill_buf);
                 fills.clear();
                 let status = self.book.add_limit_order_into(
-                    LimitOrder { id: order.id, side, price, qty, timestamp: time },
+                    LimitOrder {
+                        id: order.id,
+                        side,
+                        price,
+                        qty,
+                        timestamp: time,
+                    },
                     &mut fills,
                 );
                 self.record_fills(agent_id, side, &fills, time, mid0, out);
@@ -658,13 +766,22 @@ impl Exchange {
                 self.fill_buf = fills;
             }
             OrderAction::NewMarketOrder { side, qty, user_id } => {
-                let order = NewOrder { id: self.alloc_id(), user_id, side, qty };
+                let order = NewOrder {
+                    id: self.alloc_id(),
+                    user_id,
+                    side,
+                    qty,
+                };
                 self.record_submission(agent_id, time, side, None, qty, order.id, mid0);
                 self.push_accepted(agent_id, order, out);
                 let mut fills = std::mem::take(&mut self.fill_buf);
                 fills.clear();
                 let status = self.book.add_market_order_into(
-                    MarketOrder { id: order.id, side, qty },
+                    MarketOrder {
+                        id: order.id,
+                        side,
+                        qty,
+                    },
                     &mut fills,
                 );
                 self.record_fills(agent_id, side, &fills, time, mid0, out);
@@ -673,7 +790,10 @@ impl Exchange {
             }
             OrderAction::CancelOrder { order_id } => {
                 if self.book.cancel_order(order_id) {
-                    let user_id = self.resting.remove(&order_id).map_or(0, |info| info.user_id);
+                    let user_id = self
+                        .resting
+                        .remove(&order_id)
+                        .map_or(0, |info| info.user_id);
                     if let Some(flow) = self.flow.as_mut() {
                         flow.on_order_gone(order_id);
                     }
@@ -745,7 +865,9 @@ impl Exchange {
         order_id: u64,
         mid0: Option<f64>,
     ) {
-        let Some(flow) = self.flow.as_mut() else { return };
+        let Some(flow) = self.flow.as_mut() else {
+            return;
+        };
         if agent_id != flow.options.agent_id {
             return;
         }
@@ -778,7 +900,10 @@ impl Exchange {
             self.last_trade_time = Some(time);
 
             if let Some(flow) = self.flow.as_mut() {
-                let maker_agent = self.resting.get(&fill.maker_order_id).map(|info| info.agent_id);
+                let maker_agent = self
+                    .resting
+                    .get(&fill.maker_order_id)
+                    .map(|info| info.agent_id);
                 flow.on_fill(
                     time,
                     taker,
@@ -862,14 +987,24 @@ impl Exchange {
                 });
             }
             OrderStatus::Placed => {
-                self.resting.insert(order.id, OrderInfo {
-                    agent_id: taker, remaining_qty: order.qty, user_id: order.user_id,
-                });
+                self.resting.insert(
+                    order.id,
+                    OrderInfo {
+                        agent_id: taker,
+                        remaining_qty: order.qty,
+                        user_id: order.user_id,
+                    },
+                );
             }
             OrderStatus::Resting { remaining_qty } => {
-                self.resting.insert(order.id, OrderInfo {
-                    agent_id: taker, remaining_qty, user_id: order.user_id,
-                });
+                self.resting.insert(
+                    order.id,
+                    OrderInfo {
+                        agent_id: taker,
+                        remaining_qty,
+                        user_id: order.user_id,
+                    },
+                );
                 let filled: u64 = fills.iter().map(|f| f.qty).sum();
                 if filled > 0 {
                     out.push(RoutedMessage {
@@ -961,7 +1096,12 @@ mod tests {
     }
 
     fn limit(side: Side, price: i64, qty: u64, user_id: u64) -> OrderAction {
-        OrderAction::NewLimitOrder { side, price, qty, user_id }
+        OrderAction::NewLimitOrder {
+            side,
+            price,
+            qty,
+            user_id,
+        }
     }
 
     // Every new order gets exactly one creation ack — with symbol, side, qty
@@ -978,14 +1118,30 @@ mod tests {
         let to_taker: Vec<_> = msgs.iter().filter(|m| m.agent_id == 1).collect();
         assert_eq!(to_taker.len(), 2, "creation ack + fill");
         match to_taker[0].message {
-            ExchangeMessage::OrderAccepted { user_id, symbol, side, qty, .. } => {
+            ExchangeMessage::OrderAccepted {
+                user_id,
+                symbol,
+                side,
+                qty,
+                ..
+            } => {
                 assert_eq!((user_id, symbol, side, qty), (9, SYM, Side::Bid, 10));
             }
             other => panic!("first taker message must be the creation ack, got {other:?}"),
         }
         match to_taker[1].message {
-            ExchangeMessage::OrderFilled { user_id, symbol, side, qty, remaining, .. } => {
-                assert_eq!((user_id, symbol, side, qty, remaining), (9, SYM, Side::Bid, 10, 0));
+            ExchangeMessage::OrderFilled {
+                user_id,
+                symbol,
+                side,
+                qty,
+                remaining,
+                ..
+            } => {
+                assert_eq!(
+                    (user_id, symbol, side, qty, remaining),
+                    (9, SYM, Side::Bid, 10, 0)
+                );
             }
             other => panic!("second taker message must be the fill, got {other:?}"),
         }
@@ -1011,7 +1167,12 @@ mod tests {
             other => panic!("first message must be the creation ack, got {other:?}"),
         }
         match to_taker[1].message {
-            ExchangeMessage::OrderFilled { qty, remaining, side, .. } => {
+            ExchangeMessage::OrderFilled {
+                qty,
+                remaining,
+                side,
+                ..
+            } => {
                 assert_eq!((qty, remaining, side), (4, 6, Side::Bid));
             }
             other => panic!("second message must be the submission fill, got {other:?}"),
@@ -1033,8 +1194,18 @@ mod tests {
             .find(|m| m.agent_id == 0)
             .expect("maker must be notified of the fill");
         match maker_fill.message {
-            ExchangeMessage::OrderFilled { user_id, symbol, side, qty, remaining, .. } => {
-                assert_eq!((user_id, symbol, side, qty, remaining), (5, SYM, Side::Ask, 4, 6));
+            ExchangeMessage::OrderFilled {
+                user_id,
+                symbol,
+                side,
+                qty,
+                remaining,
+                ..
+            } => {
+                assert_eq!(
+                    (user_id, symbol, side, qty, remaining),
+                    (5, SYM, Side::Ask, 4, 6)
+                );
             }
             other => panic!("maker must receive a fill, got {other:?}"),
         }
@@ -1049,7 +1220,11 @@ mod tests {
         ex.process_into(3, limit(Side::Bid, 100, 10, 42), 0, &mut msgs);
         assert_eq!(msgs.len(), 1);
         match msgs[0].message {
-            ExchangeMessage::OrderRejected { order_id, user_id, symbol } => {
+            ExchangeMessage::OrderRejected {
+                order_id,
+                user_id,
+                symbol,
+            } => {
                 assert_eq!((order_id, user_id, symbol), (0, 42, SYM));
             }
             other => panic!("expected a rejection, got {other:?}"),
@@ -1070,7 +1245,11 @@ mod tests {
         msgs.clear();
         ex.process_into(0, OrderAction::CancelOrder { order_id: oid }, 1, &mut msgs);
         match msgs[0].message {
-            ExchangeMessage::OrderCancelled { order_id, user_id, symbol } => {
+            ExchangeMessage::OrderCancelled {
+                order_id,
+                user_id,
+                symbol,
+            } => {
                 assert_eq!((order_id, user_id, symbol), (oid, 11, SYM));
             }
             other => panic!("expected the cancel echo, got {other:?}"),
@@ -1081,7 +1260,9 @@ mod tests {
         msgs.clear();
         ex.close_into(3, &mut msgs);
         match msgs[0].message {
-            ExchangeMessage::OrderCancelled { user_id, symbol, .. } => {
+            ExchangeMessage::OrderCancelled {
+                user_id, symbol, ..
+            } => {
                 assert_eq!((user_id, symbol), (12, SYM));
             }
             other => panic!("expected the close-cancel echo, got {other:?}"),

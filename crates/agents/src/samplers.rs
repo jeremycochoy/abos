@@ -75,6 +75,10 @@ pub struct LogNormalPriceSampler {
 }
 
 impl LogNormalPriceSampler {
+    /// Construct the log-price distribution from the relative price spread.
+    ///
+    /// # Panics
+    /// Panics if the derived standard deviation is invalid.
     #[must_use]
     pub fn new(price_std: f64) -> Self {
         let log_std = (1.0 + price_std).ln();
@@ -104,6 +108,10 @@ pub struct LogNormalSizeSampler {
 }
 
 impl LogNormalSizeSampler {
+    /// Construct a log-normal size draw with the given multiplier.
+    ///
+    /// # Panics
+    /// Panics if `std` is invalid for a normal distribution.
     #[must_use]
     pub fn new(scale: f64, std: f64) -> Self {
         Self {
@@ -145,11 +153,14 @@ pub struct PoissonWakeup {
 }
 
 impl PoissonWakeup {
+    /// Construct exponential wakeup delays from their mean in nanoseconds.
+    ///
+    /// # Panics
+    /// Panics if the derived exponential rate is invalid.
     #[must_use]
     pub fn new(mean_interval_ns: u64) -> Self {
         #[allow(clippy::cast_precision_loss)]
-        let dist =
-            Exp::new(1.0 / mean_interval_ns as f64).expect("invalid mean wakeup interval");
+        let dist = Exp::new(1.0 / mean_interval_ns as f64).expect("invalid mean wakeup interval");
         Self { dist }
     }
 }
@@ -180,7 +191,11 @@ impl OffsetPriceSampler {
 }
 
 impl TrendPriceSampler for OffsetPriceSampler {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     fn sample_price(&mut self, mid: i64, side: Side, _rng: &mut SmallRng) -> i64 {
         match side {
             Side::Bid => ((mid as f64 * (1.0 + self.offset)).round() as i64).max(1),
@@ -278,8 +293,7 @@ mod tests {
             .map(|_| sampler.sample_price(mid, &mut rng) as f64)
             .collect();
         let mean: f64 = samples.iter().sum::<f64>() / n as f64;
-        let variance: f64 =
-            samples.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+        let variance: f64 = samples.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n as f64;
         let relative_std = variance.sqrt() / mean;
         assert!(
             relative_std < 0.001,
