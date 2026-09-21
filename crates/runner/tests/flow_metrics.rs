@@ -22,7 +22,14 @@ struct ScriptAgent {
 impl ScriptAgent {
     fn new(script: Vec<(Nanos, OrderAction)>) -> (Self, Seen) {
         let seen = Rc::new(RefCell::new(Vec::new()));
-        (Self { script, cursor: 0, seen: Rc::clone(&seen) }, seen)
+        (
+            Self {
+                script,
+                cursor: 0,
+                seen: Rc::clone(&seen),
+            },
+            seen,
+        )
     }
 }
 
@@ -35,7 +42,10 @@ impl Agent for ScriptAgent {
         actions: &mut Vec<AgentAction>,
     ) {
         while self.cursor < self.script.len() && self.script[self.cursor].0 == time {
-            actions.push(AgentAction::SubmitOrder { symbol: 0, order: self.script[self.cursor].1 });
+            actions.push(AgentAction::SubmitOrder {
+                symbol: 0,
+                order: self.script[self.cursor].1,
+            });
             self.cursor += 1;
         }
         if self.cursor < self.script.len() {
@@ -51,7 +61,12 @@ impl Agent for ScriptAgent {
 }
 
 fn limit(side: Side, price: i64, qty: u64) -> OrderAction {
-    OrderAction::NewLimitOrder { side, price, qty, user_id: 0 }
+    OrderAction::NewLimitOrder {
+        side,
+        price,
+        qty,
+        user_id: 0,
+    }
 }
 
 fn config() -> SimulationConfig {
@@ -88,8 +103,12 @@ fn agents(with_self_crosser: bool) -> (Vec<Box<dyn Agent>>, Seen) {
         (3_000, limit(Side::Bid, 10_300, 20)),
     ]);
     let (outsider, _) = ScriptAgent::new(vec![(2_000, limit(Side::Bid, 10_150, 3))]);
-    let mut all: Vec<Box<dyn Agent>> =
-        vec![Box::new(maker_a), Box::new(maker_b), Box::new(watched), Box::new(outsider)];
+    let mut all: Vec<Box<dyn Agent>> = vec![
+        Box::new(maker_a),
+        Box::new(maker_b),
+        Box::new(watched),
+        Box::new(outsider),
+    ];
     if with_self_crosser {
         let (crosser, _) = ScriptAgent::new(vec![
             (4_000, limit(Side::Ask, 10_400, 7)),
@@ -111,7 +130,10 @@ fn flow_options(interval_ns: Nanos) -> FlowOptions {
 
 fn run(interval_ns: Nanos, with_self_crosser: bool) -> (Vec<FlowBucket>, Vec<FlowTotals>, Seen) {
     let (agents, seen) = agents(with_self_crosser);
-    let options = RunOptions { flow: Some(flow_options(interval_ns)), ..RunOptions::default() };
+    let options = RunOptions {
+        flow: Some(flow_options(interval_ns)),
+        ..RunOptions::default()
+    };
     let result = Kernel::run_with(&config(), agents, &options);
     (result.flow_buckets, result.flow_totals, seen)
 }
@@ -129,7 +151,11 @@ fn one_bucket_counts_external_watched_and_self_flows_exactly() {
         10 * 10_100 + 5 * 10_100 + 5 * 10_200 + 3 * 10_150 + 15 * 10_200
     );
     assert_eq!(
-        (bucket.market_self_trades, bucket.market_self_qty, bucket.market_self_notional),
+        (
+            bucket.market_self_trades,
+            bucket.market_self_qty,
+            bucket.market_self_notional
+        ),
         (1, 5, 5 * 10_150)
     );
     assert_eq!(
@@ -139,7 +165,11 @@ fn one_bucket_counts_external_watched_and_self_flows_exactly() {
     assert_eq!((bucket.taker_qty, bucket.taker_notional), (35, 355_500));
     assert_eq!((bucket.maker_qty, bucket.maker_notional), (3, 3 * 10_150));
     assert_eq!(
-        (bucket.orders, bucket.rejected_orders, bucket.eligible_orders),
+        (
+            bucket.orders,
+            bucket.rejected_orders,
+            bucket.eligible_orders
+        ),
         (3, 0, 3)
     );
     assert_eq!((bucket.filled_orders, bucket.fill_events), (3, 5));
@@ -162,9 +192,16 @@ fn ratios_use_submitted_and_opposing_displayed_notional() {
     let (buckets, _, _) = run(END_TIME, false);
     let bucket = &buckets[0];
     assert_eq!(bucket.ratio_count, vec![0, 0, 1, 0, 1]);
-    assert_eq!(bucket.ratio_notional, vec![0.0, 0.0, 204_000.0, 0.0, 206_000.0]);
     assert_eq!(
-        (bucket.zero_depth_count, bucket.zero_depth_qty, bucket.zero_depth_notional),
+        bucket.ratio_notional,
+        vec![0.0, 0.0, 204_000.0, 0.0, 206_000.0]
+    );
+    assert_eq!(
+        (
+            bucket.zero_depth_count,
+            bucket.zero_depth_qty,
+            bucket.zero_depth_notional
+        ),
         (1, 8, 81_200.0)
     );
 }
@@ -178,12 +215,23 @@ fn shortfall_splits_taker_and_maker_components_against_the_pre_trade_mid() {
         + (10_200.0 / 10_000.0 - 1.0) * 51_000.0
         + (10_200.0 / 10_025.0 - 1.0) * 153_000.0;
     let maker = -(10_150.0 / 10_025.0 - 1.0) * 30_450.0;
-    assert!((bucket.shortfall_taker - taker).abs() < 1e-9, "{}", bucket.shortfall_taker);
+    assert!(
+        (bucket.shortfall_taker - taker).abs() < 1e-9,
+        "{}",
+        bucket.shortfall_taker
+    );
     assert_eq!(bucket.shortfall_taker_base, 355_500);
-    assert!((bucket.shortfall_maker - maker).abs() < 1e-9, "{}", bucket.shortfall_maker);
+    assert!(
+        (bucket.shortfall_maker - maker).abs() < 1e-9,
+        "{}",
+        bucket.shortfall_maker
+    );
     assert_eq!(bucket.shortfall_maker_base, 30_450);
     assert_eq!(
-        (bucket.shortfall_excluded_count, bucket.shortfall_excluded_notional),
+        (
+            bucket.shortfall_excluded_count,
+            bucket.shortfall_excluded_notional
+        ),
         (0, 0)
     );
 }
@@ -218,7 +266,11 @@ fn a_self_trade_of_any_agent_leaves_the_market_denominator() {
     assert_eq!(bucket.market_trades, 5);
     assert_eq!(bucket.market_notional, 385_950);
     assert_eq!(
-        (bucket.market_self_trades, bucket.market_self_qty, bucket.market_self_notional),
+        (
+            bucket.market_self_trades,
+            bucket.market_self_qty,
+            bucket.market_self_notional
+        ),
         (2, 12, 5 * 10_150 + 7 * 10_400)
     );
     assert_eq!(
@@ -234,9 +286,13 @@ fn the_taker_fill_message_carries_the_exact_notional_across_levels() {
         .borrow()
         .iter()
         .filter_map(|message| match *message {
-            ExchangeMessage::OrderFilled { side: Side::Bid, price, qty, notional, .. } => {
-                Some((qty, price, notional))
-            }
+            ExchangeMessage::OrderFilled {
+                side: Side::Bid,
+                price,
+                qty,
+                notional,
+                ..
+            } => Some((qty, price, notional)),
             _ => None,
         })
         .collect();
@@ -252,28 +308,46 @@ fn the_maker_fill_message_carries_its_own_notional() {
         .borrow()
         .iter()
         .filter_map(|message| match *message {
-            ExchangeMessage::OrderFilled { side: Side::Ask, price, qty, notional, .. } => {
-                Some((qty, price, notional))
-            }
+            ExchangeMessage::OrderFilled {
+                side: Side::Ask,
+                price,
+                qty,
+                notional,
+                ..
+            } => Some((qty, price, notional)),
             _ => None,
         })
         .collect();
-    assert_eq!(sales, vec![(3, 10_150, 3 * 10_150), (5, 10_150, 5 * 10_150)]);
+    assert_eq!(
+        sales,
+        vec![(3, 10_150, 3 * 10_150), (5, 10_150, 5 * 10_150)]
+    );
 }
 
 #[test]
 fn short_intervals_carry_live_orders_into_the_next_cohort() {
     let (buckets, _, _) = run(2_000, false);
     assert_eq!(buckets.len(), 500);
-    assert!(buckets.iter().enumerate().all(|(i, b)| b.start == 2_000 * i as u64));
+    assert!(buckets
+        .iter()
+        .enumerate()
+        .all(|(i, b)| b.start == 2_000 * i as u64));
     assert_eq!(
-        (buckets[0].orders, buckets[0].eligible_orders, buckets[0].filled_orders),
+        (
+            buckets[0].orders,
+            buckets[0].eligible_orders,
+            buckets[0].filled_orders
+        ),
         (2, 2, 1)
     );
     assert_eq!(buckets[0].fill_events, 3);
     assert_eq!(buckets[0].market_trades, 3);
     assert_eq!(
-        (buckets[1].orders, buckets[1].eligible_orders, buckets[1].filled_orders),
+        (
+            buckets[1].orders,
+            buckets[1].eligible_orders,
+            buckets[1].filled_orders
+        ),
         (1, 2, 2)
     );
     assert_eq!(buckets[1].fill_events, 2);
@@ -285,7 +359,10 @@ fn short_intervals_carry_live_orders_into_the_next_cohort() {
     let single = run(END_TIME, false).0;
     let split_num: f64 = buckets.iter().map(|b| b.response_num[0]).sum();
     assert!((split_num - single[0].response_num[0]).abs() < 1e-9);
-    let split_excluded: f64 = buckets.iter().map(|b| b.response_excluded_notional[1]).sum();
+    let split_excluded: f64 = buckets
+        .iter()
+        .map(|b| b.response_excluded_notional[1])
+        .sum();
     assert!((split_excluded - single[0].response_excluded_notional[1]).abs() < 1e-9);
 }
 
@@ -293,7 +370,10 @@ fn short_intervals_carry_live_orders_into_the_next_cohort() {
 fn without_flow_options_the_run_gives_the_same_trades_and_no_buckets() {
     let (with_flow_agents, _) = agents(false);
     let (plain_agents, _) = agents(false);
-    let options = RunOptions { flow: Some(flow_options(END_TIME)), ..RunOptions::default() };
+    let options = RunOptions {
+        flow: Some(flow_options(END_TIME)),
+        ..RunOptions::default()
+    };
     let with_flow = Kernel::run_with(&config(), with_flow_agents, &options);
     let plain = Kernel::run_with(&config(), plain_agents, &RunOptions::default());
     assert!(plain.flow_buckets.is_empty());
@@ -309,5 +389,8 @@ fn without_flow_options_the_run_gives_the_same_trades_and_no_buckets() {
         .map(|t| u128::from(t.price.unsigned_abs()) * u128::from(t.qty))
         .sum();
     let bucket = &with_flow.flow_buckets[0];
-    assert_eq!(notional, bucket.market_notional + bucket.market_self_notional);
+    assert_eq!(
+        notional,
+        bucket.market_notional + bucket.market_self_notional
+    );
 }

@@ -69,10 +69,7 @@ fn a_cancelled_order_leaves_the_executable_depth() {
         (50, 101 * 10 + 105 * 40)
     );
     assert!(book.cancel_order(4));
-    assert_eq!(
-        book.executable_depth(Side::Ask, Some(98)),
-        (15, 98 * 15)
-    );
+    assert_eq!(book.executable_depth(Side::Ask, Some(98)), (15, 98 * 15));
 }
 
 #[test]
