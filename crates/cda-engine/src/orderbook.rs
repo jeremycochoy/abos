@@ -24,6 +24,11 @@ pub struct OrderBook {
     orders: HashMap<u64, (Side, i64, u64)>,
     /// Reusable fill buffer to avoid per-call allocation.
     fill_buf: Vec<Fill>,
+    /// Cached best bid as (price, live volume), kept in step with `bids` so
+    /// hot-path BBO reads cost no tree walk.
+    best_bid_cache: Option<(i64, u64)>,
+    /// Cached best ask as (price, live volume).
+    best_ask_cache: Option<(i64, u64)>,
 }
 
 impl OrderBook {
@@ -35,6 +40,8 @@ impl OrderBook {
             asks: BTreeMap::new(),
             orders: HashMap::new(),
             fill_buf: Vec::new(),
+            best_bid_cache: None,
+            best_ask_cache: None,
         }
     }
 
@@ -117,19 +124,59 @@ impl OrderBook {
                 book_side.remove(&price);
             }
         }
+        if self.reaches_best(side, price) {
+            self.refresh_best(side);
+        }
         true
     }
 
     /// Best (highest) bid price, or `None` if the bid side is empty.
     #[must_use]
     pub fn best_bid(&self) -> Option<i64> {
-        self.bids.keys().next_back().copied()
+        self.best_bid_cache.map(|(price, _)| price)
     }
 
     /// Best (lowest) ask price, or `None` if the ask side is empty.
     #[must_use]
     pub fn best_ask(&self) -> Option<i64> {
-        self.asks.keys().next().copied()
+        self.best_ask_cache.map(|(price, _)| price)
+    }
+
+    /// Best bid as (price, live volume at that price), or `None` if the bid
+    /// side is empty. Reads the cache: no tree walk.
+    #[must_use]
+    pub fn best_bid_level(&self) -> Option<(i64, u64)> {
+        self.best_bid_cache
+    }
+
+    /// Best ask as (price, live volume at that price), or `None` if the ask
+    /// side is empty. Reads the cache: no tree walk.
+    #[must_use]
+    pub fn best_ask_level(&self) -> Option<(i64, u64)> {
+        self.best_ask_cache
+    }
+
+    /// Recompute one side's cache from its tree. Called only when a change
+    /// touches that side's best level.
+    fn refresh_best(&mut self, side: Side) {
+        match side {
+            Side::Bid => {
+                self.best_bid_cache =
+                    self.bids.last_key_value().map(|(&price, level)| (price, level.total_qty));
+            }
+            Side::Ask => {
+                self.best_ask_cache =
+                    self.asks.first_key_value().map(|(&price, level)| (price, level.total_qty));
+            }
+        }
+    }
+
+    /// True when `price` is at least as good as the side's cached best.
+    fn reaches_best(&self, side: Side, price: i64) -> bool {
+        match side {
+            Side::Bid => self.best_bid_cache.is_none_or(|(best, _)| price >= best),
+            Side::Ask => self.best_ask_cache.is_none_or(|(best, _)| price <= best),
+        }
     }
 
     /// Spread (best ask − best bid), or `None` if either side is empty.
@@ -234,6 +281,10 @@ impl OrderBook {
         if level.orders.is_empty() {
             book_side.remove(&price);
         }
+        self.refresh_best(match taker_side {
+            Side::Bid => Side::Ask,
+            Side::Ask => Side::Bid,
+        });
     }
 
     /// Insert a resting order into the appropriate side and register it in the lookup map.
@@ -249,6 +300,22 @@ impl OrderBook {
         });
         level.total_qty += order.qty;
         level.orders.push_back(order);
+        let cache = match side {
+            Side::Bid => &mut self.best_bid_cache,
+            Side::Ask => &mut self.best_ask_cache,
+        };
+        let better = match (side, *cache) {
+            (_, None) => true,
+            (Side::Bid, Some((best, _))) => price > best,
+            (Side::Ask, Some((best, _))) => price < best,
+        };
+        if better {
+            *cache = Some((price, level.total_qty));
+        } else if let Some((best, volume)) = cache {
+            if *best == price {
+                *volume += order.qty;
+            }
+        }
     }
 }
 

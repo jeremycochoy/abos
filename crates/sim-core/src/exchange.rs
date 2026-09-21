@@ -175,8 +175,8 @@ impl Exchange {
     /// Current top-of-book snapshot.
     #[must_use]
     pub fn snapshot(&self) -> MarketSnapshot {
-        let best_bid = self.book.best_bid().map(|p| (p, self.book.volume_at(p, Side::Bid)));
-        let best_ask = self.book.best_ask().map(|p| (p, self.book.volume_at(p, Side::Ask)));
+        let best_bid = self.book.best_bid_level();
+        let best_ask = self.book.best_ask_level();
         MarketSnapshot {
             best_bid,
             best_ask,
@@ -436,10 +436,8 @@ impl Exchange {
     }
 
     fn record_l1(&mut self, time: Nanos) {
-        let bid_price = self.book.best_bid().unwrap_or(0);
-        let ask_price = self.book.best_ask().unwrap_or(0);
-        let bid_volume = self.book.best_bid().map_or(0, |p| self.book.volume_at(p, Side::Bid));
-        let ask_volume = self.book.best_ask().map_or(0, |p| self.book.volume_at(p, Side::Ask));
+        let (bid_price, bid_volume) = self.book.best_bid_level().unwrap_or((0, 0));
+        let (ask_price, ask_volume) = self.book.best_ask_level().unwrap_or((0, 0));
         if let Some(bucket_ns) = self.l1_bucket_ns {
             let bucket_start = time - time % bucket_ns;
             if self.open_bucket.map(|b| b.bucket_start) != Some(bucket_start) {

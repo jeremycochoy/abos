@@ -84,7 +84,7 @@ impl Agent for ProbeAgent {
             .best_bid
             .zip(snapshots[0].best_ask)
             .map_or(10_000, |((b, _), (a, _))| (b + a) / 2);
-        let side = if self.counter % 2 == 0 { Side::Bid } else { Side::Ask };
+        let side = if self.counter.is_multiple_of(2) { Side::Bid } else { Side::Ask };
         let offset = 1 + (self.counter % 5) as i64;
         let price = if side == Side::Bid { mid - offset } else { mid + offset };
         actions.push(AgentAction::SubmitOrder {
@@ -96,7 +96,7 @@ impl Agent for ProbeAgent {
                 user_id: self.counter,
             },
         });
-        if self.counter % 3 == 0 {
+        if self.counter.is_multiple_of(3) {
             if let Some(order_id) = self.open_orders.pop() {
                 actions.push(AgentAction::CancelOrder { symbol: 0, order_id });
             }
