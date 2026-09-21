@@ -11,7 +11,7 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
-use crate::exchange::{L1Snapshot, TradeRecord};
+use crate::exchange::{L1Bucket, L1Snapshot, TradeRecord};
 
 /// Write trade records to a Parquet file.
 ///
@@ -104,6 +104,71 @@ pub fn write_l1_snapshots(
     Ok(())
 }
 
+/// Write L1 bucket aggregates to a Parquet file.
+///
+/// The schema carries `tick_size`, `lot_size` and `bucket_ns` as metadata.
+/// `quote_volume` lands as `Float64`: a value past 2^53 keeps its scale and
+/// loses its last bits, like the float pipeline that reads it. Writes in
+/// batches of 1 million rows to limit peak arrow memory usage.
+///
+/// # Errors
+/// Returns an error if the file cannot be created or written.
+pub fn write_l1_buckets(
+    path: &Path,
+    buckets: &[L1Bucket],
+    tick_size: i64,
+    lot_size: u64,
+    bucket_ns: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const CHUNK: usize = 1_000_000;
+
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("bucket_start", DataType::UInt64, false),
+            Field::new("symbol", DataType::UInt64, false),
+            Field::new("first_bid", DataType::Int64, false),
+            Field::new("min_bid", DataType::Int64, false),
+            Field::new("last_bid", DataType::Int64, false),
+            Field::new("first_ask", DataType::Int64, false),
+            Field::new("max_ask", DataType::Int64, false),
+            Field::new("last_ask", DataType::Int64, false),
+            Field::new("volume", DataType::UInt64, false),
+            Field::new("quote_volume", DataType::Float64, false),
+        ],
+        HashMap::from([
+            ("tick_size".into(), tick_size.to_string()),
+            ("lot_size".into(), lot_size.to_string()),
+            ("bucket_ns".into(), bucket_ns.to_string()),
+        ]),
+    ));
+
+    let file = File::create(path)?;
+    let props = WriterProperties::builder().build();
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+
+    for chunk in buckets.chunks(CHUNK) {
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(UInt64Array::from_iter_values(chunk.iter().map(|b| b.bucket_start))),
+            Arc::new(UInt64Array::from_iter_values(chunk.iter().map(|b| u64::from(b.symbol)))),
+            Arc::new(Int64Array::from_iter_values(chunk.iter().map(|b| b.first_bid))),
+            Arc::new(Int64Array::from_iter_values(chunk.iter().map(|b| b.min_bid))),
+            Arc::new(Int64Array::from_iter_values(chunk.iter().map(|b| b.last_bid))),
+            Arc::new(Int64Array::from_iter_values(chunk.iter().map(|b| b.first_ask))),
+            Arc::new(Int64Array::from_iter_values(chunk.iter().map(|b| b.max_ask))),
+            Arc::new(Int64Array::from_iter_values(chunk.iter().map(|b| b.last_ask))),
+            Arc::new(UInt64Array::from_iter_values(chunk.iter().map(|b| b.volume))),
+            #[allow(clippy::cast_precision_loss)]
+            Arc::new(Float64Array::from_iter_values(
+                chunk.iter().map(|b| b.quote_volume as f64),
+            )),
+        ])?;
+        writer.write(&batch)?;
+    }
+
+    writer.close()?;
+    Ok(())
+}
+
 /// A single 1-minute OHLCV candle with nanosecond timestamp.
 #[derive(Debug, Clone, Copy)]
 pub struct Candle {
@@ -176,4 +241,52 @@ pub fn write_klines(
 
     writer.close()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Array;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    #[test]
+    fn l1_buckets_round_trip_through_parquet() {
+        let mut first = L1Bucket::new(0, 1);
+        first.absorb(101, 103, 4, 6);
+        let mut second = L1Bucket::new(60_000_000_000, 1);
+        second.absorb(0, 0, 0, 0);
+        second.absorb(99, 105, 1, 2);
+        let path = std::env::temp_dir()
+            .join(format!("l1_buckets_{}.parquet", std::process::id()));
+        write_l1_buckets(&path, &[first, second], 100, 5, 60_000_000_000).unwrap();
+
+        let file = File::open(&path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let metadata = reader.schema().metadata().clone();
+        assert_eq!(metadata["tick_size"], "100");
+        assert_eq!(metadata["lot_size"], "5");
+        assert_eq!(metadata["bucket_ns"], "60000000000");
+
+        let batches: Vec<RecordBatch> =
+            reader.build().unwrap().collect::<Result<_, _>>().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+        let int_column = |name: &str| -> Vec<i64> {
+            let column = batch.column_by_name(name).unwrap();
+            let values = column.as_any().downcast_ref::<Int64Array>().unwrap();
+            (0..values.len()).map(|i| values.value(i)).collect()
+        };
+        assert_eq!(int_column("min_bid"), vec![101, 99]);
+        assert_eq!(int_column("max_ask"), vec![103, 105]);
+        assert_eq!(int_column("last_bid"), vec![101, 99]);
+        let volume = batch.column_by_name("volume").unwrap();
+        let volume = volume.as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert_eq!((volume.value(0), volume.value(1)), (10, 3));
+        let notional = batch.column_by_name("quote_volume").unwrap();
+        let notional = notional.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!((notional.value(0) - 1022.0).abs() < 1e-9);
+        assert!((notional.value(1) - 309.0).abs() < 1e-9);
+    }
 }
