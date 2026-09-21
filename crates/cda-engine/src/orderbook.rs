@@ -224,22 +224,32 @@ impl OrderBook {
     }
 
     #[must_use]
-    pub fn executable_depth(&self, taker_side: Side, limit_price: Option<i64>) -> u64 {
+    pub fn executable_depth(&self, taker_side: Side, limit_price: Option<i64>) -> (u64, u128) {
+        let mut qty: u64 = 0;
+        let mut notional: u128 = 0;
+        let mut add = |price: i64, level_qty: u64| {
+            qty += level_qty;
+            notional += u128::from(price.unsigned_abs()) * u128::from(level_qty);
+        };
         match taker_side {
-            Side::Bid => self
-                .asks
-                .iter()
-                .take_while(|(&price, _)| limit_price.is_none_or(|limit| price <= limit))
-                .map(|(_, level)| level.total_qty)
-                .sum(),
-            Side::Ask => self
-                .bids
-                .iter()
-                .rev()
-                .take_while(|(&price, _)| limit_price.is_none_or(|limit| price >= limit))
-                .map(|(_, level)| level.total_qty)
-                .sum(),
+            Side::Bid => {
+                for (&price, level) in &self.asks {
+                    if limit_price.is_some_and(|limit| price > limit) {
+                        break;
+                    }
+                    add(price, level.total_qty);
+                }
+            }
+            Side::Ask => {
+                for (&price, level) in self.bids.iter().rev() {
+                    if limit_price.is_some_and(|limit| price < limit) {
+                        break;
+                    }
+                    add(price, level.total_qty);
+                }
+            }
         }
+        (qty, notional)
     }
 
     // ── internal matching ──────────────────────────────────────────────

@@ -4,7 +4,7 @@ use rand::SeedableRng;
 use crate::agent::{Agent, AgentAction};
 use crate::config::SimulationConfig;
 use crate::event::{EventPayload, ExchangeMessage, OrderAction};
-use crate::exchange::{Exchange, FlowBucket, FlowOptions, L1Bucket, L1Snapshot, RoutedMessage, TradeRecord};
+use crate::exchange::{Exchange, FlowBucket, FlowOptions, FlowTotals, L1Bucket, L1Snapshot, RoutedMessage, TradeRecord};
 use crate::latency::LatencyModel;
 use crate::types::{MarketSnapshot, Nanos, Symbol};
 
@@ -15,6 +15,7 @@ pub struct SimulationResult {
     /// L1 bucket aggregates. Empty unless [`RunOptions::l1_bucket_ns`] is set.
     pub l1_buckets: Vec<L1Bucket>,
     pub flow_buckets: Vec<FlowBucket>,
+    pub flow_totals: Vec<FlowTotals>,
     pub events_processed: u64,
     pub end_time: Nanos,
 }
@@ -441,8 +442,12 @@ impl Kernel {
         }
         let configured_end = self.end_time;
         let mut flow_buckets = Vec::new();
+        let mut flow_totals = Vec::new();
         for ex in &mut self.exchanges {
-            flow_buckets.extend(ex.flush_flow(configured_end));
+            if let Some((buckets, totals)) = ex.flush_flow(configured_end) {
+                flow_buckets.extend(buckets);
+                flow_totals.push(totals);
+            }
         }
         flow_buckets.sort_by_key(|bucket| bucket.start);
         let exchanges = &mut self.exchanges;
@@ -451,7 +456,15 @@ impl Kernel {
             merge_by_time(exchanges, |ex| std::mem::take(&mut ex.l1_snapshots), |s| s.timestamp);
         let l1_buckets =
             merge_by_time(exchanges, |ex| std::mem::take(&mut ex.l1_buckets), |b| b.bucket_start);
-        SimulationResult { trades, l1_snapshots, l1_buckets, flow_buckets, events_processed, end_time }
+        SimulationResult {
+            trades,
+            l1_snapshots,
+            l1_buckets,
+            flow_buckets,
+            flow_totals,
+            events_processed,
+            end_time,
+        }
     }
 }
 

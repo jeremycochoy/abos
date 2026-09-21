@@ -109,6 +109,9 @@ pub struct FlowBucket {
     pub market_trades: u64,
     pub market_qty: u64,
     pub market_notional: u128,
+    pub market_self_trades: u64,
+    pub market_self_qty: u64,
+    pub market_self_notional: u128,
     pub self_trades: u64,
     pub self_qty: u64,
     pub self_notional: u128,
@@ -117,15 +120,27 @@ pub struct FlowBucket {
     pub maker_qty: u64,
     pub maker_notional: u128,
     pub orders: u64,
+    pub rejected_orders: u64,
+    pub eligible_orders: u64,
     pub filled_orders: u64,
     pub fill_events: u64,
     pub submitted_qty: u64,
-    pub ratio_qty: Vec<u64>,
+    pub ratio_notional: Vec<f64>,
+    pub ratio_count: Vec<u64>,
+    pub zero_depth_count: u64,
     pub zero_depth_qty: u64,
-    pub shortfall: f64,
-    pub shortfall_base: u128,
+    pub zero_depth_notional: f64,
+    pub shortfall_taker: f64,
+    pub shortfall_taker_base: u128,
+    pub shortfall_maker: f64,
+    pub shortfall_maker_base: u128,
+    pub shortfall_excluded_count: u64,
+    pub shortfall_excluded_notional: u128,
     pub response_num: Vec<f64>,
     pub response_den: Vec<f64>,
+    pub response_count: Vec<u64>,
+    pub response_excluded_notional: Vec<f64>,
+    pub response_excluded_count: Vec<u64>,
 }
 
 impl FlowBucket {
@@ -136,6 +151,9 @@ impl FlowBucket {
             market_trades: 0,
             market_qty: 0,
             market_notional: 0,
+            market_self_trades: 0,
+            market_self_qty: 0,
+            market_self_notional: 0,
             self_trades: 0,
             self_qty: 0,
             self_notional: 0,
@@ -144,17 +162,38 @@ impl FlowBucket {
             maker_qty: 0,
             maker_notional: 0,
             orders: 0,
+            rejected_orders: 0,
+            eligible_orders: 0,
             filled_orders: 0,
             fill_events: 0,
             submitted_qty: 0,
-            ratio_qty: vec![0; bins],
+            ratio_notional: vec![0.0; bins],
+            ratio_count: vec![0; bins],
+            zero_depth_count: 0,
             zero_depth_qty: 0,
-            shortfall: 0.0,
-            shortfall_base: 0,
+            zero_depth_notional: 0.0,
+            shortfall_taker: 0.0,
+            shortfall_taker_base: 0,
+            shortfall_maker: 0.0,
+            shortfall_maker_base: 0,
+            shortfall_excluded_count: 0,
+            shortfall_excluded_notional: 0,
             response_num: vec![0.0; horizons],
             response_den: vec![0.0; horizons],
+            response_count: vec![0; horizons],
+            response_excluded_notional: vec![0.0; horizons],
+            response_excluded_count: vec![0; horizons],
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlowTotals {
+    pub symbol: Symbol,
+    pub accepted_orders: u64,
+    pub rejected_orders: u64,
+    pub filled_orders: u64,
+    pub fill_events: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -170,7 +209,11 @@ struct FlowRecorder {
     symbol: Symbol,
     buckets: Vec<FlowBucket>,
     pending: Vec<std::collections::VecDeque<PendingResponse>>,
-    filled_ids: FxHashSet<u64>,
+    live: FxHashSet<u64>,
+    filled_in_interval: FxHashSet<u64>,
+    ever_filled: FxHashSet<u64>,
+    totals: FlowTotals,
+    current_interval: usize,
     prevailing_mid: Option<f64>,
 }
 
@@ -182,7 +225,17 @@ impl FlowRecorder {
             symbol,
             buckets: Vec::new(),
             pending: vec![std::collections::VecDeque::new(); horizons],
-            filled_ids: FxHashSet::default(),
+            live: FxHashSet::default(),
+            filled_in_interval: FxHashSet::default(),
+            ever_filled: FxHashSet::default(),
+            totals: FlowTotals {
+                symbol,
+                accepted_orders: 0,
+                rejected_orders: 0,
+                filled_orders: 0,
+                fill_events: 0,
+            },
+            current_interval: 0,
             prevailing_mid: None,
         }
     }
@@ -205,24 +258,58 @@ impl FlowRecorder {
         &mut self.buckets[index]
     }
 
-    fn on_new_order(&mut self, time: Nanos, agent_id: AgentId, qty: u64, depth: u64) {
+    fn roll_to(&mut self, index: usize) {
+        while self.current_interval < index {
+            self.current_interval += 1;
+            let carried = self.live.len() as u64;
+            let interval = self.current_interval;
+            self.bucket_at(interval).eligible_orders = carried;
+            self.filled_in_interval.clear();
+        }
+    }
+
+    fn on_accept(&mut self, time: Nanos, agent_id: AgentId, order_id: u64, qty: u64) {
         if agent_id != self.options.agent_id {
             return;
         }
         let index = self.bucket_index(time);
-        let edges_below = if depth > 0 {
-            #[allow(clippy::cast_precision_loss)]
-            let ratio = qty as f64 / depth as f64;
-            Some(self.options.ratio_edges.partition_point(|&edge| edge <= ratio))
-        } else {
-            None
-        };
+        self.roll_to(index);
         let bucket = self.bucket_at(index);
         bucket.orders += 1;
+        bucket.eligible_orders += 1;
         bucket.submitted_qty += qty;
-        match edges_below {
-            Some(bin) => bucket.ratio_qty[bin] += qty,
-            None => bucket.zero_depth_qty += qty,
+        self.live.insert(order_id);
+        self.totals.accepted_orders += 1;
+    }
+
+    fn on_reject(&mut self, time: Nanos, agent_id: AgentId) {
+        if agent_id != self.options.agent_id {
+            return;
+        }
+        let index = self.bucket_index(time);
+        self.roll_to(index);
+        self.bucket_at(index).rejected_orders += 1;
+        self.totals.rejected_orders += 1;
+    }
+
+    fn on_depth(&mut self, time: Nanos, qty: u64, order_notional: Option<f64>, depth_notional: u128) {
+        let index = self.bucket_index(time);
+        self.roll_to(index);
+        #[allow(clippy::cast_precision_loss)]
+        let edges_below = order_notional
+            .filter(|_| depth_notional > 0)
+            .map(|notional| {
+                let ratio = notional / depth_notional as f64;
+                self.options.ratio_edges.partition_point(|&edge| edge <= ratio)
+            });
+        let bucket = self.bucket_at(index);
+        if let Some(bin) = edges_below {
+            bucket.ratio_notional[bin] += order_notional.unwrap_or(0.0);
+            bucket.ratio_count[bin] += 1;
+        } else {
+            bucket.zero_depth_count += 1;
+            bucket.zero_depth_qty += qty;
+            bucket.zero_depth_notional += order_notional.unwrap_or(0.0);
         }
     }
 
@@ -239,28 +326,21 @@ impl FlowRecorder {
         qty: u64,
         mid0: Option<f64>,
     ) {
+        let index = self.bucket_index(time);
+        self.roll_to(index);
         let watched = self.options.agent_id;
         let notional = u128::from(price.unsigned_abs()) * u128::from(qty);
-        let taker_is_watched = taker_agent == watched;
-        let maker_is_watched = maker_agent == Some(watched);
-        let index = self.bucket_index(time);
-        if taker_is_watched || maker_is_watched {
-            let mut first_fills = 0;
-            if taker_is_watched && self.filled_ids.insert(taker_order_id) {
-                first_fills += 1;
-            }
-            if maker_is_watched && self.filled_ids.insert(maker_order_id) {
-                first_fills += 1;
-            }
+        if maker_agent == Some(taker_agent) {
+            let watched_self = taker_agent == watched;
             let bucket = self.bucket_at(index);
-            bucket.fill_events += 1;
-            bucket.filled_orders += first_fills;
-        }
-        if taker_is_watched && maker_is_watched {
-            let bucket = self.bucket_at(index);
-            bucket.self_trades += 1;
-            bucket.self_qty += qty;
-            bucket.self_notional += notional;
+            bucket.market_self_trades += 1;
+            bucket.market_self_qty += qty;
+            bucket.market_self_notional += notional;
+            if watched_self {
+                bucket.self_trades += 1;
+                bucket.self_qty += qty;
+                bucket.self_notional += notional;
+            }
             return;
         }
         {
@@ -269,8 +349,17 @@ impl FlowRecorder {
             bucket.market_qty += qty;
             bucket.market_notional += notional;
         }
+        let taker_is_watched = taker_agent == watched;
+        let maker_is_watched = maker_agent == Some(watched);
         if !taker_is_watched && !maker_is_watched {
             return;
+        }
+        let order_id = if maker_is_watched { maker_order_id } else { taker_order_id };
+        let newly_filled_here = self.filled_in_interval.insert(order_id);
+        let newly_filled_ever = self.ever_filled.insert(order_id);
+        self.totals.fill_events += 1;
+        if newly_filled_ever {
+            self.totals.filled_orders += 1;
         }
         let side = if taker_is_watched {
             taker_side
@@ -286,21 +375,41 @@ impl FlowRecorder {
         };
         #[allow(clippy::cast_precision_loss)]
         let notional_f64 = notional as f64;
-        let bucket = self.bucket_at(index);
-        if taker_is_watched {
-            bucket.taker_qty += qty;
-            bucket.taker_notional += notional;
-            if let Some(mid0) = mid0 {
-                #[allow(clippy::cast_precision_loss)]
-                let cost = sign * (price as f64 - mid0) / mid0;
-                bucket.shortfall += cost * notional_f64;
-                bucket.shortfall_base += notional;
+        let valid_mid0 = mid0.filter(|&m| m.is_finite() && m > 0.0);
+        let horizons = self.options.horizons_ns.len();
+        {
+            let bucket = self.bucket_at(index);
+            bucket.fill_events += 1;
+            if newly_filled_here {
+                bucket.filled_orders += 1;
             }
-        } else {
-            bucket.maker_qty += qty;
-            bucket.maker_notional += notional;
+            if taker_is_watched {
+                bucket.taker_qty += qty;
+                bucket.taker_notional += notional;
+            } else {
+                bucket.maker_qty += qty;
+                bucket.maker_notional += notional;
+            }
+            if let Some(mid0) = valid_mid0 {
+                #[allow(clippy::cast_precision_loss)]
+                let cost = sign * (price as f64 / mid0 - 1.0);
+                if taker_is_watched {
+                    bucket.shortfall_taker += cost * notional_f64;
+                    bucket.shortfall_taker_base += notional;
+                } else {
+                    bucket.shortfall_maker += cost * notional_f64;
+                    bucket.shortfall_maker_base += notional;
+                }
+            } else {
+                bucket.shortfall_excluded_count += 1;
+                bucket.shortfall_excluded_notional += notional;
+                for horizon in 0..horizons {
+                    bucket.response_excluded_notional[horizon] += notional_f64;
+                    bucket.response_excluded_count[horizon] += 1;
+                }
+            }
         }
-        if let Some(mid0) = mid0 {
+        if let Some(mid0) = valid_mid0 {
             for (horizon, &delay) in self.options.horizons_ns.iter().enumerate() {
                 self.pending[horizon].push_back(PendingResponse {
                     due: time + delay,
@@ -313,7 +422,8 @@ impl FlowRecorder {
     }
 
     fn on_order_gone(&mut self, order_id: u64) {
-        self.filled_ids.remove(&order_id);
+        self.live.remove(&order_id);
+        self.ever_filled.remove(&order_id);
     }
 
     fn resolve_due(&mut self, before: Nanos) {
@@ -324,30 +434,43 @@ impl FlowRecorder {
                     break;
                 }
                 self.pending[horizon].pop_front();
+                let bucket = &mut self.buckets[entry.bucket];
                 if let Some(mid) = mid {
-                    let bucket = &mut self.buckets[entry.bucket];
                     bucket.response_num[horizon] +=
-                        entry.signed_notional * (mid - entry.mid0) / entry.mid0;
+                        entry.signed_notional * (mid / entry.mid0 - 1.0);
                     bucket.response_den[horizon] += entry.signed_notional.abs();
+                    bucket.response_count[horizon] += 1;
+                } else {
+                    bucket.response_excluded_notional[horizon] += entry.signed_notional.abs();
+                    bucket.response_excluded_count[horizon] += 1;
                 }
             }
         }
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn on_quote(&mut self, time: Nanos, bid_price: i64, ask_price: i64) {
-        if bid_price > 0 && ask_price > 0 {
-            self.resolve_due(time);
-            #[allow(clippy::cast_precision_loss)]
-            let mid = (bid_price as f64 + ask_price as f64) / 2.0;
-            self.prevailing_mid = Some(mid);
-        }
+        self.resolve_due(time);
+        self.prevailing_mid = if bid_price > 0 && ask_price > 0 {
+            Some(f64::midpoint(bid_price as f64, ask_price as f64))
+        } else {
+            None
+        };
     }
 
-    fn flush(&mut self, end_time: Nanos) -> Vec<FlowBucket> {
+    fn flush(&mut self, end_time: Nanos) -> (Vec<FlowBucket>, FlowTotals) {
         self.resolve_due(end_time.saturating_add(1));
+        for horizon in 0..self.pending.len() {
+            while let Some(entry) = self.pending[horizon].pop_front() {
+                let bucket = &mut self.buckets[entry.bucket];
+                bucket.response_excluded_notional[horizon] += entry.signed_notional.abs();
+                bucket.response_excluded_count[horizon] += 1;
+            }
+        }
         let last_index = self.bucket_index(end_time.saturating_sub(1));
         self.bucket_at(last_index);
-        std::mem::take(&mut self.buckets)
+        self.roll_to(last_index);
+        (std::mem::take(&mut self.buckets), self.totals)
     }
 }
 
@@ -425,10 +548,8 @@ impl Exchange {
     }
 
     #[must_use]
-    pub fn flush_flow(&mut self, end_time: Nanos) -> Vec<FlowBucket> {
-        self.flow
-            .as_mut()
-            .map_or_else(Vec::new, |flow| flow.flush(end_time))
+    pub fn flush_flow(&mut self, end_time: Nanos) -> Option<(Vec<FlowBucket>, FlowTotals)> {
+        self.flow.as_mut().map(|flow| flow.flush(end_time))
     }
 
     /// Push the open bucket, if any, into `l1_buckets`.
@@ -500,6 +621,11 @@ impl Exchange {
                 OrderAction::NewLimitOrder { user_id, .. }
                 | OrderAction::NewMarketOrder { user_id, .. } => (0, user_id),
             };
+            if !matches!(action, OrderAction::CancelOrder { .. }) {
+                if let Some(flow) = self.flow.as_mut() {
+                    flow.on_reject(time, agent_id);
+                }
+            }
             out.push(RoutedMessage {
                 agent_id,
                 message: ExchangeMessage::OrderRejected { order_id, user_id, symbol: self.sym },
@@ -508,16 +634,18 @@ impl Exchange {
         }
 
         let bbo_before = (self.book.best_bid(), self.book.best_ask());
+        #[allow(clippy::cast_precision_loss)]
         let mid0 = match bbo_before {
-            #[allow(clippy::cast_precision_loss)]
-            (Some(bid), Some(ask)) => Some((bid as f64 + ask as f64) / 2.0),
+            (Some(bid), Some(ask)) if bid > 0 && ask > 0 => {
+                Some(f64::midpoint(bid as f64, ask as f64))
+            }
             _ => None,
         };
 
         match action {
             OrderAction::NewLimitOrder { side, price, qty, user_id } => {
                 let order = NewOrder { id: self.alloc_id(), user_id, side, qty };
-                self.record_submission(agent_id, time, side, Some(price), qty);
+                self.record_submission(agent_id, time, side, Some(price), qty, order.id, mid0);
                 self.push_accepted(agent_id, order, out);
                 let mut fills = std::mem::take(&mut self.fill_buf);
                 fills.clear();
@@ -531,7 +659,7 @@ impl Exchange {
             }
             OrderAction::NewMarketOrder { side, qty, user_id } => {
                 let order = NewOrder { id: self.alloc_id(), user_id, side, qty };
-                self.record_submission(agent_id, time, side, None, qty);
+                self.record_submission(agent_id, time, side, None, qty, order.id, mid0);
                 self.push_accepted(agent_id, order, out);
                 let mut fills = std::mem::take(&mut self.fill_buf);
                 fills.clear();
@@ -606,6 +734,7 @@ impl Exchange {
         });
     }
 
+    #[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
     fn record_submission(
         &mut self,
         agent_id: AgentId,
@@ -613,13 +742,22 @@ impl Exchange {
         side: Side,
         limit_price: Option<i64>,
         qty: u64,
+        order_id: u64,
+        mid0: Option<f64>,
     ) {
         let Some(flow) = self.flow.as_mut() else { return };
         if agent_id != flow.options.agent_id {
             return;
         }
-        let depth = self.book.executable_depth(side, limit_price);
-        flow.on_new_order(time, agent_id, qty, depth);
+        flow.on_accept(time, agent_id, order_id, qty);
+        let (_, depth_notional) = self.book.executable_depth(side, limit_price);
+        let order_notional = match limit_price {
+            Some(limit) => Some(limit.unsigned_abs() as f64 * qty as f64),
+            None => mid0
+                .filter(|&m| m.is_finite() && m > 0.0)
+                .map(|m| m * qty as f64),
+        };
+        flow.on_depth(time, qty, order_notional, depth_notional);
     }
 
     fn record_fills(
