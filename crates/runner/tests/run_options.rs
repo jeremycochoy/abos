@@ -49,7 +49,7 @@ fn make_agents(symbols: &[Symbol], per_symbol: usize, seed: u64) -> Vec<Box<dyn 
         let cfg = zi_config(symbol);
         for i in 0..per_symbol {
             let agent_seed = seed.wrapping_add(u64::from(symbol) * 1000 + i as u64);
-            agents.push(Box::new(ZiAgent::new(cfg.clone(), agent_seed)));
+            agents.push(Box::new(ZiAgent::new(cfg, agent_seed)));
         }
     }
     agents

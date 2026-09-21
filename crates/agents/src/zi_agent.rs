@@ -12,7 +12,7 @@ use crate::samplers::{
 use crate::utils::{IndexedSet, mid_price};
 
 /// Configuration for a zero-intelligence agent with default samplers.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
 pub struct ZiAgentConfig {
     /// Wakeup interval in nanoseconds (fixed, not exponential).
     pub wake_up_interval_ns: u64,

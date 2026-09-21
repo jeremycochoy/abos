@@ -31,7 +31,7 @@ fn make_agents(n: usize, seed: u64) -> Vec<Box<dyn Agent>> {
         symbol: 0,
     };
     (0..n)
-        .map(|i| Box::new(ZiAgent::new(cfg.clone(), seed.wrapping_add(i as u64))) as Box<dyn Agent>)
+        .map(|i| Box::new(ZiAgent::new(cfg, seed.wrapping_add(i as u64))) as Box<dyn Agent>)
         .collect()
 }
 

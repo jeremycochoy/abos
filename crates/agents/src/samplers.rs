@@ -289,11 +289,11 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
         let mid: i64 = 10_000_000;
         let n = 50_000;
-        let samples: Vec<f64> = (0..n)
+        let prices: Vec<f64> = (0..n)
             .map(|_| sampler.sample_price(mid, &mut rng) as f64)
             .collect();
-        let mean: f64 = samples.iter().sum::<f64>() / n as f64;
-        let variance: f64 = samples.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+        let mean: f64 = prices.iter().sum::<f64>() / n as f64;
+        let variance: f64 = prices.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n as f64;
         let relative_std = variance.sqrt() / mean;
         assert!(
             relative_std < 0.001,

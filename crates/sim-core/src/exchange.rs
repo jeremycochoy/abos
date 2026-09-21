@@ -170,16 +170,20 @@ pub struct FlowBucket {
     pub submitted_qty: u64,
     /// Submitted notional per finite depth-ratio bin, in tick-lots.
     /// Limits use limit price times quantity. Market orders use the pre-submit mid.
-    /// Depth includes all live opposing displayed orders through the limit, including own orders.
+    /// Depth includes external live opposing displayed orders through the limit.
     pub ratio_notional: Vec<f64>,
     /// Accepted order count per finite depth-ratio bin.
     pub ratio_count: Vec<u64>,
-    /// Orders with zero executable depth or no market-order valuation mid.
+    /// Valued orders with zero external executable depth.
     pub zero_depth_count: u64,
-    /// Quantity of those unsupported orders, in lots.
+    /// Quantity of those zero-depth orders, in lots.
     pub zero_depth_qty: u64,
-    /// Valued notional of those unsupported orders. Missing valuations contribute zero.
+    /// Submitted notional of those zero-depth orders, in tick-lots.
     pub zero_depth_notional: f64,
+    /// Market orders without a valid pre-submit valuation mid, separate from zero depth.
+    pub unvalued_count: u64,
+    /// Quantity of those unvalued orders, in lots.
+    pub unvalued_qty: u64,
     /// Sum of external taker notional times signed shortfall.
     pub shortfall_taker: f64,
     /// External taker notional with a valid pre-trade mid.
@@ -233,6 +237,8 @@ impl FlowBucket {
             zero_depth_count: 0,
             zero_depth_qty: 0,
             zero_depth_notional: 0.0,
+            unvalued_count: 0,
+            unvalued_qty: 0,
             shortfall_taker: 0.0,
             shortfall_taker_base: 0,
             shortfall_maker: 0.0,
@@ -283,6 +289,7 @@ struct FlowRecorder {
     pending: Vec<std::collections::VecDeque<PendingResponse>>,
     live: FxHashSet<u64>,
     filled_in_interval: FxHashSet<u64>,
+    filled_in_previous_interval: FxHashSet<u64>,
     ever_filled: FxHashSet<u64>,
     totals: FlowTotals,
     current_interval: usize,
@@ -299,6 +306,7 @@ impl FlowRecorder {
             pending: vec![std::collections::VecDeque::new(); horizons],
             live: FxHashSet::default(),
             filled_in_interval: FxHashSet::default(),
+            filled_in_previous_interval: FxHashSet::default(),
             ever_filled: FxHashSet::default(),
             totals: FlowTotals {
                 symbol,
@@ -336,7 +344,7 @@ impl FlowRecorder {
             let carried = self.live.len() as u64;
             let interval = self.current_interval;
             self.bucket_at(interval).eligible_orders = carried;
-            self.filled_in_interval.clear();
+            self.filled_in_previous_interval = std::mem::take(&mut self.filled_in_interval);
         }
     }
 
@@ -383,13 +391,20 @@ impl FlowRecorder {
                     .partition_point(|&edge| edge <= ratio)
             });
         let bucket = self.bucket_at(index);
-        if let Some(bin) = edges_below {
-            bucket.ratio_notional[bin] += order_notional.unwrap_or(0.0);
-            bucket.ratio_count[bin] += 1;
-        } else {
-            bucket.zero_depth_count += 1;
-            bucket.zero_depth_qty += qty;
-            bucket.zero_depth_notional += order_notional.unwrap_or(0.0);
+        match (order_notional, edges_below) {
+            (Some(notional), Some(bin)) => {
+                bucket.ratio_notional[bin] += notional;
+                bucket.ratio_count[bin] += 1;
+            }
+            (Some(notional), None) => {
+                bucket.zero_depth_count += 1;
+                bucket.zero_depth_qty += qty;
+                bucket.zero_depth_notional += notional;
+            }
+            (None, _) => {
+                bucket.unvalued_count += 1;
+                bucket.unvalued_qty += qty;
+            }
         }
     }
 
@@ -505,7 +520,9 @@ impl FlowRecorder {
         }
     }
 
-    fn on_order_gone(&mut self, order_id: u64) {
+    fn on_order_gone(&mut self, time: Nanos, order_id: u64) {
+        let index = self.bucket_index(time);
+        self.roll_to(index);
         self.live.remove(&order_id);
         self.ever_filled.remove(&order_id);
     }
@@ -554,7 +571,64 @@ impl FlowRecorder {
         let last_index = self.bucket_index(end_time.saturating_sub(1));
         self.bucket_at(last_index);
         self.roll_to(last_index);
+        while self.buckets.len() > last_index + 1 {
+            let terminal = self.buckets.pop().expect("terminal bucket");
+            let repeat_filled = self
+                .filled_in_interval
+                .iter()
+                .filter(|id| self.filled_in_previous_interval.contains(id))
+                .count() as u64;
+            self.filled_in_interval.clear();
+            let last = &mut self.buckets[last_index];
+            last.eligible_orders += terminal.orders;
+            last.filled_orders += terminal.filled_orders - repeat_filled;
+            add_terminal_flows(last, &terminal);
+        }
         (std::mem::take(&mut self.buckets), self.totals)
+    }
+}
+
+fn add_terminal_flows(last: &mut FlowBucket, terminal: &FlowBucket) {
+    last.market_trades += terminal.market_trades;
+    last.market_qty += terminal.market_qty;
+    last.market_notional += terminal.market_notional;
+    last.market_self_trades += terminal.market_self_trades;
+    last.market_self_qty += terminal.market_self_qty;
+    last.market_self_notional += terminal.market_self_notional;
+    last.self_trades += terminal.self_trades;
+    last.self_qty += terminal.self_qty;
+    last.self_notional += terminal.self_notional;
+    last.taker_qty += terminal.taker_qty;
+    last.taker_notional += terminal.taker_notional;
+    last.maker_qty += terminal.maker_qty;
+    last.maker_notional += terminal.maker_notional;
+    last.orders += terminal.orders;
+    last.rejected_orders += terminal.rejected_orders;
+    last.fill_events += terminal.fill_events;
+    last.submitted_qty += terminal.submitted_qty;
+    for (total, part) in last.ratio_notional.iter_mut().zip(&terminal.ratio_notional) {
+        *total += part;
+    }
+    for (total, part) in last.ratio_count.iter_mut().zip(&terminal.ratio_count) {
+        *total += part;
+    }
+    last.zero_depth_count += terminal.zero_depth_count;
+    last.zero_depth_qty += terminal.zero_depth_qty;
+    last.zero_depth_notional += terminal.zero_depth_notional;
+    last.unvalued_count += terminal.unvalued_count;
+    last.unvalued_qty += terminal.unvalued_qty;
+    last.shortfall_taker += terminal.shortfall_taker;
+    last.shortfall_taker_base += terminal.shortfall_taker_base;
+    last.shortfall_maker += terminal.shortfall_maker;
+    last.shortfall_maker_base += terminal.shortfall_maker_base;
+    last.shortfall_excluded_count += terminal.shortfall_excluded_count;
+    last.shortfall_excluded_notional += terminal.shortfall_excluded_notional;
+    for horizon in 0..last.response_num.len() {
+        last.response_num[horizon] += terminal.response_num[horizon];
+        last.response_den[horizon] += terminal.response_den[horizon];
+        last.response_count[horizon] += terminal.response_count[horizon];
+        last.response_excluded_notional[horizon] += terminal.response_excluded_notional[horizon];
+        last.response_excluded_count[horizon] += terminal.response_excluded_count[horizon];
     }
 }
 
@@ -564,11 +638,14 @@ struct NewOrder {
     id: u64,
     user_id: u64,
     side: Side,
+    price: i64,
     qty: u64,
 }
 
 struct OrderInfo {
     agent_id: AgentId,
+    side: Side,
+    price: i64,
     remaining_qty: u64,
     /// Owner's tag, echoed on every message about the order (0 = unset).
     user_id: u64,
@@ -677,7 +754,7 @@ impl Exchange {
         for (&oid, info) in &self.resting {
             self.book.cancel_order(oid);
             if let Some(flow) = self.flow.as_mut() {
-                flow.on_order_gone(oid);
+                flow.on_order_gone(time, oid);
             }
             out.push(RoutedMessage {
                 agent_id: info.agent_id,
@@ -745,6 +822,7 @@ impl Exchange {
                     id: self.alloc_id(),
                     user_id,
                     side,
+                    price,
                     qty,
                 };
                 self.record_submission(agent_id, time, side, Some(price), qty, order.id, mid0);
@@ -762,7 +840,7 @@ impl Exchange {
                     &mut fills,
                 );
                 self.record_fills(agent_id, side, &fills, time, mid0, out);
-                self.notify_taker(agent_id, order, status, &fills, out);
+                self.notify_taker(agent_id, order, status, &fills, time, out);
                 self.fill_buf = fills;
             }
             OrderAction::NewMarketOrder { side, qty, user_id } => {
@@ -770,6 +848,7 @@ impl Exchange {
                     id: self.alloc_id(),
                     user_id,
                     side,
+                    price: 0,
                     qty,
                 };
                 self.record_submission(agent_id, time, side, None, qty, order.id, mid0);
@@ -785,7 +864,7 @@ impl Exchange {
                     &mut fills,
                 );
                 self.record_fills(agent_id, side, &fills, time, mid0, out);
-                self.notify_taker(agent_id, order, status, &fills, out);
+                self.notify_taker(agent_id, order, status, &fills, time, out);
                 self.fill_buf = fills;
             }
             OrderAction::CancelOrder { order_id } => {
@@ -795,7 +874,7 @@ impl Exchange {
                         .remove(&order_id)
                         .map_or(0, |info| info.user_id);
                     if let Some(flow) = self.flow.as_mut() {
-                        flow.on_order_gone(order_id);
+                        flow.on_order_gone(time, order_id);
                     }
                     out.push(RoutedMessage {
                         agent_id,
@@ -871,15 +950,27 @@ impl Exchange {
         if agent_id != flow.options.agent_id {
             return;
         }
-        flow.on_accept(time, agent_id, order_id, qty);
         let (_, depth_notional) = self.book.executable_depth(side, limit_price);
+        let executable = |price: i64| match side {
+            Side::Bid => limit_price.is_none_or(|limit| price <= limit),
+            Side::Ask => limit_price.is_none_or(|limit| price >= limit),
+        };
+        let own_notional: u128 = flow
+            .live
+            .iter()
+            .filter_map(|id| self.resting.get(id))
+            .filter(|info| info.side != side && executable(info.price))
+            .map(|info| u128::from(info.price.unsigned_abs()) * u128::from(info.remaining_qty))
+            .sum();
+        let external_depth = depth_notional.saturating_sub(own_notional);
+        flow.on_accept(time, agent_id, order_id, qty);
         let order_notional = match limit_price {
             Some(limit) => Some(limit.unsigned_abs() as f64 * qty as f64),
             None => mid0
                 .filter(|&m| m.is_finite() && m > 0.0)
                 .map(|m| m * qty as f64),
         };
-        flow.on_depth(time, qty, order_notional, depth_notional);
+        flow.on_depth(time, qty, order_notional, external_depth);
     }
 
     fn record_fills(
@@ -947,7 +1038,7 @@ impl Exchange {
                 if info.remaining_qty == 0 {
                     self.resting.remove(&fill.maker_order_id);
                     if let Some(flow) = self.flow.as_mut() {
-                        flow.on_order_gone(fill.maker_order_id);
+                        flow.on_order_gone(time, fill.maker_order_id);
                     }
                 }
             }
@@ -960,13 +1051,14 @@ impl Exchange {
         order: NewOrder,
         status: OrderStatus,
         fills: &[Fill],
+        time: Nanos,
         out: &mut Vec<RoutedMessage>,
     ) {
         let last_price = fills.last().map_or(0, |f| f.price);
         let notional: u128 = fills.iter().map(fill_notional).sum();
         if matches!(status, OrderStatus::Filled | OrderStatus::Cancelled { .. }) {
             if let Some(flow) = self.flow.as_mut() {
-                flow.on_order_gone(order.id);
+                flow.on_order_gone(time, order.id);
             }
         }
         match status {
@@ -991,6 +1083,8 @@ impl Exchange {
                     order.id,
                     OrderInfo {
                         agent_id: taker,
+                        side: order.side,
+                        price: order.price,
                         remaining_qty: order.qty,
                         user_id: order.user_id,
                     },
@@ -1001,6 +1095,8 @@ impl Exchange {
                     order.id,
                     OrderInfo {
                         agent_id: taker,
+                        side: order.side,
+                        price: order.price,
                         remaining_qty,
                         user_id: order.user_id,
                     },
@@ -1267,5 +1363,123 @@ mod tests {
             }
             other => panic!("expected the close-cancel echo, got {other:?}"),
         }
+    }
+
+    fn flow_exchange(ratio_edges: Vec<f64>) -> Exchange {
+        let mut ex = Exchange::new(SYM, 1);
+        ex.set_flow_options(Some(FlowOptions {
+            agent_id: 0,
+            interval_ns: 100,
+            horizons_ns: vec![10],
+            ratio_edges,
+        }));
+        ex.open(0);
+        ex
+    }
+
+    fn place(ex: &mut Exchange, owner: AgentId, time: Nanos, action: OrderAction) -> u64 {
+        let mut out = Vec::new();
+        ex.process_into(owner, action, time, &mut out);
+        out.iter()
+            .find_map(|routed| match routed.message {
+                ExchangeMessage::OrderAccepted { order_id, .. } if routed.agent_id == owner => {
+                    Some(order_id)
+                }
+                _ => None,
+            })
+            .expect("creation ack")
+    }
+
+    #[test]
+    fn the_depth_ratio_excludes_the_watched_agents_own_resting_orders() {
+        let mut ex = flow_exchange(vec![0.5, 1.0]);
+        place(&mut ex, 0, 0, limit(Side::Ask, 100, 10, 0));
+        place(&mut ex, 1, 1, limit(Side::Ask, 100, 10, 0));
+        place(&mut ex, 0, 2, limit(Side::Bid, 100, 10, 0));
+        let (rows, _) = ex.flush_flow(99).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ratio_count, vec![0, 0, 1]);
+        assert_eq!(rows[0].ratio_notional, vec![0.0, 0.0, 1_000.0]);
+        assert_eq!(rows[0].zero_depth_count, 1);
+        assert_eq!(rows[0].zero_depth_qty, 10);
+    }
+
+    #[test]
+    fn the_own_depth_exclusion_uses_the_remaining_quantity() {
+        let mut ex = flow_exchange(vec![0.5, 2.0]);
+        place(&mut ex, 0, 0, limit(Side::Ask, 100, 10, 0));
+        place(&mut ex, 1, 1, limit(Side::Bid, 100, 4, 0));
+        place(&mut ex, 1, 2, limit(Side::Ask, 100, 10, 0));
+        place(&mut ex, 0, 3, limit(Side::Bid, 100, 16, 0));
+        let (rows, _) = ex.flush_flow(99).unwrap();
+        assert_eq!(rows[0].ratio_count, vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn a_carried_order_canceled_in_a_new_interval_stays_in_that_cohort() {
+        let mut ex = flow_exchange(vec![0.5, 1.0]);
+        let order_id = place(&mut ex, 0, 0, limit(Side::Bid, 100, 10, 0));
+        ex.process_into(
+            0,
+            OrderAction::CancelOrder { order_id },
+            110,
+            &mut Vec::new(),
+        );
+        let (rows, _) = ex.flush_flow(199).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].eligible_orders, 1);
+        assert_eq!(rows[1].orders, 0);
+        assert_eq!(rows[1].filled_orders, 0);
+    }
+
+    #[test]
+    fn an_event_exactly_at_the_end_lands_in_the_last_interval() {
+        let mut ex = flow_exchange(vec![0.5, 1.0]);
+        place(&mut ex, 0, 200, limit(Side::Bid, 100, 10, 0));
+        let (rows, totals) = ex.flush_flow(200).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].orders, 1);
+        assert_eq!(rows[1].eligible_orders, 1);
+        assert_eq!(totals.accepted_orders, 1);
+    }
+
+    #[test]
+    fn a_fill_exactly_at_the_end_does_not_repeat_the_filled_order() {
+        let mut ex = flow_exchange(vec![0.5, 1.0]);
+        place(&mut ex, 0, 50, limit(Side::Bid, 100, 10, 0));
+        place(&mut ex, 1, 150, limit(Side::Ask, 100, 3, 0));
+        place(&mut ex, 1, 200, limit(Side::Ask, 100, 3, 0));
+        let (rows, totals) = ex.flush_flow(200).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].filled_orders, 1);
+        assert_eq!(rows[1].fill_events, 2);
+        assert_eq!(rows[1].eligible_orders, 1);
+        assert_eq!(rows[1].market_trades, 2);
+        assert_eq!(totals.filled_orders, 1);
+        assert_eq!(totals.fill_events, 2);
+    }
+
+    #[test]
+    fn a_market_order_without_a_mid_is_unvalued_not_zero_depth() {
+        let mut ex = flow_exchange(vec![0.5, 1.0]);
+        place(&mut ex, 1, 0, limit(Side::Ask, 100, 5, 0));
+        let mut out = Vec::new();
+        ex.process_into(
+            0,
+            OrderAction::NewMarketOrder {
+                side: Side::Bid,
+                qty: 5,
+                user_id: 0,
+            },
+            1,
+            &mut out,
+        );
+        place(&mut ex, 0, 2, limit(Side::Ask, 90, 4, 0));
+        let (rows, _) = ex.flush_flow(99).unwrap();
+        assert_eq!((rows[0].unvalued_count, rows[0].unvalued_qty), (1, 5));
+        assert_eq!(rows[0].zero_depth_count, 1);
+        assert_eq!(rows[0].zero_depth_qty, 4);
+        assert!((rows[0].zero_depth_notional - 360.0).abs() < 1e-12);
+        assert_eq!(rows[0].ratio_count, vec![0, 0, 0]);
     }
 }

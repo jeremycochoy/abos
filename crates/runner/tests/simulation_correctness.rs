@@ -39,7 +39,7 @@ fn sim_config(seed: u64, duration_ns: u64) -> SimulationConfig {
 fn make_zi_agents(n: usize, seed: u64) -> Vec<Box<dyn Agent>> {
     let cfg = zi_config();
     (0..n)
-        .map(|i| Box::new(ZiAgent::new(cfg.clone(), seed.wrapping_add(i as u64))) as Box<dyn Agent>)
+        .map(|i| Box::new(ZiAgent::new(cfg, seed.wrapping_add(i as u64))) as Box<dyn Agent>)
         .collect()
 }
 
@@ -379,7 +379,7 @@ fn mixed_agents_simulation() {
     let cfg = sim_config(42, 200_000_000);
     let zi_cfg = zi_config();
     let mut agents: Vec<Box<dyn Agent>> = (0..5)
-        .map(|i| Box::new(ZiAgent::new(zi_cfg.clone(), 42 + i)) as Box<dyn Agent>)
+        .map(|i| Box::new(ZiAgent::new(zi_cfg, 42 + i)) as Box<dyn Agent>)
         .collect();
     agents.push(Box::new(TrendFollowingAgent::new(
         TrendFollowingConfig {

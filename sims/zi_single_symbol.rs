@@ -45,7 +45,7 @@ fn main() {
     };
 
     let agents: Vec<Box<dyn Agent>> = (0..20)
-        .map(|i| Box::new(ZiAgent::new(zi_cfg.clone(), config.seed.wrapping_add(i))) as _)
+        .map(|i| Box::new(ZiAgent::new(zi_cfg, config.seed.wrapping_add(i))) as _)
         .collect();
 
     let start = Instant::now();
