@@ -422,6 +422,7 @@ impl FlowRecorder {
         qty: u64,
         mid0: Option<f64>,
     ) {
+        self.resolve_due(time);
         let index = self.bucket_index(time);
         self.roll_to(index);
         let watched = self.options.agent_id;
@@ -1484,5 +1485,45 @@ mod tests {
         assert_eq!(rows[0].zero_depth_qty, 4);
         assert!((rows[0].zero_depth_notional - 360.0).abs() < 1e-12);
         assert_eq!(rows[0].ratio_count, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn fixed_price_partial_fills_keep_the_pending_responses_bounded() {
+        let mut ex = Exchange::new(SYM, 1);
+        ex.set_flow_options(Some(FlowOptions {
+            agent_id: 0,
+            interval_ns: 1_000_000,
+            horizons_ns: vec![10, 1_000],
+            ratio_edges: vec![0.5, 1.0],
+        }));
+        ex.open(0);
+        place(&mut ex, 1, 1, limit(Side::Bid, 90, 1, 0));
+        place(&mut ex, 1, 2, limit(Side::Ask, 100, 50, 0));
+        for fill in 1..=10 {
+            place(&mut ex, 0, fill * 100, limit(Side::Bid, 100, 1, 0));
+            let flow = ex.flow.as_ref().unwrap();
+            let pending: Vec<usize> = flow
+                .pending
+                .iter()
+                .map(std::collections::VecDeque::len)
+                .collect();
+            assert!(
+                pending[0] <= 1,
+                "fill {fill} keeps {} expired entries",
+                pending[0]
+            );
+            assert_eq!(pending[1] as u64, fill);
+        }
+        let (rows, _) = ex.flush_flow(1_500).unwrap();
+        let row = &rows[0];
+        assert_eq!(row.response_count[0], 10);
+        assert!((row.response_den[0] - 1_000.0).abs() < 1e-12);
+        assert!(row.response_num[0].abs() < 1e-12);
+        assert_eq!(row.response_count[1], 5);
+        assert!((row.response_den[1] - 500.0).abs() < 1e-12);
+        assert!(row.response_num[1].abs() < 1e-12);
+        assert_eq!(row.response_excluded_count[1], 5);
+        assert!((row.response_excluded_notional[1] - 500.0).abs() < 1e-12);
+        assert_eq!(row.response_excluded_count[0], 0);
     }
 }
