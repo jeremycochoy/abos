@@ -4,7 +4,9 @@ use rand::SeedableRng;
 use crate::agent::{Agent, AgentAction};
 use crate::config::SimulationConfig;
 use crate::event::{EventPayload, ExchangeMessage, OrderAction};
-use crate::exchange::{Exchange, L1Bucket, L1Snapshot, RoutedMessage, TradeRecord};
+use crate::exchange::{
+    Exchange, FlowBucket, FlowOptions, FlowTotals, L1Bucket, L1Snapshot, RoutedMessage, TradeRecord,
+};
 use crate::latency::LatencyModel;
 use crate::types::{MarketSnapshot, Nanos, Symbol};
 
@@ -14,6 +16,10 @@ pub struct SimulationResult {
     pub l1_snapshots: Vec<L1Snapshot>,
     /// L1 bucket aggregates. Empty unless [`RunOptions::l1_bucket_ns`] is set.
     pub l1_buckets: Vec<L1Bucket>,
+    /// Per-symbol flow intervals. Empty unless [`RunOptions::flow`] is set.
+    pub flow_buckets: Vec<FlowBucket>,
+    /// Distinct order totals for each symbol over the whole run.
+    pub flow_totals: Vec<FlowTotals>,
     pub events_processed: u64,
     pub end_time: Nanos,
 }
@@ -32,11 +38,17 @@ pub struct RunOptions {
     /// nanoseconds. The aggregation discards the L1 detail below that
     /// scale. `None` keeps the full log.
     pub l1_bucket_ns: Option<Nanos>,
+    /// Online diagnostics for one agent. Independent of trade and L1 log retention.
+    pub flow: Option<FlowOptions>,
 }
 
 impl Default for RunOptions {
     fn default() -> Self {
-        Self { keep_trades: true, l1_bucket_ns: None }
+        Self {
+            keep_trades: true,
+            l1_bucket_ns: None,
+            flow: None,
+        }
     }
 }
 
@@ -103,7 +115,9 @@ impl EventQueue {
             self.heap[0] = last;
             self.sift_down(0);
         }
-        let payload = self.slots[top.slot as usize].take().expect("slot is filled");
+        let payload = self.slots[top.slot as usize]
+            .take()
+            .expect("slot is filled");
         self.free.push(top.slot);
         #[allow(clippy::cast_possible_truncation)]
         Some(((top.key >> 64) as Nanos, top.key as u64, payload))
@@ -177,10 +191,7 @@ impl Kernel {
     /// Run the simulation to completion, with the default output: every
     /// trade and every L1 snapshot stays in memory.
     #[must_use]
-    pub fn run(
-        config: &SimulationConfig,
-        agents: Vec<Box<dyn Agent>>,
-    ) -> SimulationResult {
+    pub fn run(config: &SimulationConfig, agents: Vec<Box<dyn Agent>>) -> SimulationResult {
         Self::run_with(config, agents, &RunOptions::default())
     }
 
@@ -194,10 +205,21 @@ impl Kernel {
         mut agents: Vec<Box<dyn Agent>>,
         options: &RunOptions,
     ) -> SimulationResult {
-        assert!(options.l1_bucket_ns != Some(0), "l1_bucket_ns must be positive");
+        assert!(
+            options.l1_bucket_ns != Some(0),
+            "l1_bucket_ns must be positive"
+        );
+        if let Some(flow) = &options.flow {
+            assert!(flow.interval_ns > 0, "flow interval_ns must be positive");
+            assert!(
+                flow.ratio_edges.windows(2).all(|pair| pair[0] < pair[1]),
+                "flow ratio_edges must increase"
+            );
+        }
         let mut k = Self::init(config, agents.len());
         for ex in &mut k.exchanges {
             ex.set_run_options(options.keep_trades, options.l1_bucket_ns);
+            ex.set_flow_options(options.flow.clone());
         }
         k.schedule_lifecycle(config, agents.len());
         let (events_processed, current_time) = k.event_loop(config.end_time, &mut agents);
@@ -248,11 +270,7 @@ impl Kernel {
         }
     }
 
-    fn event_loop(
-        &mut self,
-        end_time: Nanos,
-        agents: &mut [Box<dyn Agent>],
-    ) -> (u64, Nanos) {
+    fn event_loop(&mut self, end_time: Nanos, agents: &mut [Box<dyn Agent>]) -> (u64, Nanos) {
         let mut count: u64 = 0;
         let mut last_time = 0;
         let mut beyond: Option<(Nanos, u64)> = None;
@@ -347,7 +365,11 @@ impl Kernel {
                 }
                 self.action_buf = actions;
             }
-            EventPayload::OrderArrival { agent_id, symbol, order } => {
+            EventPayload::OrderArrival {
+                agent_id,
+                symbol,
+                order,
+            } => {
                 if let Some(idx) = self.find_exchange_idx(symbol) {
                     self.msg_buf.clear();
                     self.exchanges[idx].process_into(agent_id, order, now, &mut self.msg_buf);
@@ -391,16 +413,25 @@ impl Kernel {
         match action {
             AgentAction::SubmitOrder { symbol, order } => {
                 let lat = self.latency.agent_to_exchange(agent_id, &mut self.rng);
-                self.push(now + lat, EventPayload::OrderArrival {
-                    agent_id, symbol, order,
-                });
+                self.push(
+                    now + lat,
+                    EventPayload::OrderArrival {
+                        agent_id,
+                        symbol,
+                        order,
+                    },
+                );
             }
             AgentAction::CancelOrder { symbol, order_id } => {
                 let lat = self.latency.agent_to_exchange(agent_id, &mut self.rng);
-                self.push(now + lat, EventPayload::OrderArrival {
-                    agent_id, symbol,
-                    order: OrderAction::CancelOrder { order_id },
-                });
+                self.push(
+                    now + lat,
+                    EventPayload::OrderArrival {
+                        agent_id,
+                        symbol,
+                        order: OrderAction::CancelOrder { order_id },
+                    },
+                );
             }
             AgentAction::ScheduleWakeUp { delay_ns } => {
                 let wake = now + delay_ns;
@@ -421,21 +452,45 @@ impl Kernel {
         self.exchanges.iter().position(|ex| ex.symbol() == symbol)
     }
 
-    fn collect_results(
-        mut self,
-        events_processed: u64,
-        end_time: Nanos,
-    ) -> SimulationResult {
+    fn collect_results(mut self, events_processed: u64, end_time: Nanos) -> SimulationResult {
         for ex in &mut self.exchanges {
             ex.flush_l1_bucket();
         }
+        let configured_end = self.end_time;
+        let mut flow_buckets = Vec::new();
+        let mut flow_totals = Vec::new();
+        for ex in &mut self.exchanges {
+            if let Some((buckets, totals)) = ex.flush_flow(configured_end) {
+                flow_buckets.extend(buckets);
+                flow_totals.push(totals);
+            }
+        }
+        flow_buckets.sort_by_key(|bucket| bucket.start);
         let exchanges = &mut self.exchanges;
-        let trades = merge_by_time(exchanges, |ex| std::mem::take(&mut ex.trades), |t| t.timestamp);
-        let l1_snapshots =
-            merge_by_time(exchanges, |ex| std::mem::take(&mut ex.l1_snapshots), |s| s.timestamp);
-        let l1_buckets =
-            merge_by_time(exchanges, |ex| std::mem::take(&mut ex.l1_buckets), |b| b.bucket_start);
-        SimulationResult { trades, l1_snapshots, l1_buckets, events_processed, end_time }
+        let trades = merge_by_time(
+            exchanges,
+            |ex| std::mem::take(&mut ex.trades),
+            |t| t.timestamp,
+        );
+        let l1_snapshots = merge_by_time(
+            exchanges,
+            |ex| std::mem::take(&mut ex.l1_snapshots),
+            |s| s.timestamp,
+        );
+        let l1_buckets = merge_by_time(
+            exchanges,
+            |ex| std::mem::take(&mut ex.l1_buckets),
+            |b| b.bucket_start,
+        );
+        SimulationResult {
+            trades,
+            l1_snapshots,
+            l1_buckets,
+            flow_buckets,
+            flow_totals,
+            events_processed,
+            end_time,
+        }
     }
 }
 
@@ -479,8 +534,9 @@ mod merge_tests {
     /// The merge equals concatenate-and-stable-sort, ties included.
     #[test]
     fn merge_matches_stable_sort_with_ties() {
-        let mut exchanges: Vec<Exchange> =
-            (0..3).map(|i| Exchange::new(i, u64::from(i) * 10)).collect();
+        let mut exchanges: Vec<Exchange> = (0..3)
+            .map(|i| Exchange::new(i, u64::from(i) * 10))
+            .collect();
         let logs: [&[u64]; 3] = [&[1, 5, 5, 9], &[0, 5, 9, 9, 12], &[5, 5]];
         for (ex, log) in exchanges.iter_mut().zip(logs) {
             for &t in log {
@@ -495,12 +551,14 @@ mod merge_tests {
                 });
             }
         }
-        let mut expected: Vec<_> =
-            exchanges.iter().flat_map(|ex| ex.trades.clone()).collect();
+        let mut expected: Vec<_> = exchanges.iter().flat_map(|ex| ex.trades.clone()).collect();
         expected.sort_by_key(|t| t.timestamp);
 
-        let merged =
-            merge_by_time(&mut exchanges, |ex| std::mem::take(&mut ex.trades), |t| t.timestamp);
+        let merged = merge_by_time(
+            &mut exchanges,
+            |ex| std::mem::take(&mut ex.trades),
+            |t| t.timestamp,
+        );
         let pairs: Vec<_> = merged.iter().map(|t| (t.timestamp, t.symbol)).collect();
         let expected_pairs: Vec<_> = expected.iter().map(|t| (t.timestamp, t.symbol)).collect();
         assert_eq!(pairs, expected_pairs);
@@ -531,9 +589,17 @@ mod queue_tests {
         for _ in 0..10_000 {
             if roll() % 3 != 0 {
                 let time = roll() % 64;
-                let payload = EventPayload::WakeUp { agent_id: usize::try_from(seq).unwrap() };
+                let payload = EventPayload::WakeUp {
+                    agent_id: usize::try_from(seq).unwrap(),
+                };
                 fast.push(time, seq, payload);
-                reference.push(Event { delivery_time: time, seq, payload: EventPayload::WakeUp { agent_id: usize::try_from(seq).unwrap() } });
+                reference.push(Event {
+                    delivery_time: time,
+                    seq,
+                    payload: EventPayload::WakeUp {
+                        agent_id: usize::try_from(seq).unwrap(),
+                    },
+                });
                 seq += 1;
             } else {
                 let got = fast.pop().map(|(time, s, _)| (time, s));

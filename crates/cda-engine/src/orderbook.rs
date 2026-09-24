@@ -63,7 +63,11 @@ impl OrderBook {
     ///
     /// # Panics
     /// Panics in debug mode if `qty == 0` or `price < 0`.
-    pub fn add_limit_order_into(&mut self, order: LimitOrder, fills: &mut Vec<Fill>) -> OrderStatus {
+    pub fn add_limit_order_into(
+        &mut self,
+        order: LimitOrder,
+        fills: &mut Vec<Fill>,
+    ) -> OrderStatus {
         debug_assert!(order.qty > 0, "limit order qty must be > 0");
         debug_assert!(order.price >= 0, "price must be non-negative");
 
@@ -77,15 +81,21 @@ impl OrderBook {
         if remaining == 0 {
             OrderStatus::Filled
         } else {
-            self.place_resting(order.side, order.price, RestingOrder {
-                id: order.id,
-                qty: remaining,
-                timestamp: order.timestamp,
-            });
+            self.place_resting(
+                order.side,
+                order.price,
+                RestingOrder {
+                    id: order.id,
+                    qty: remaining,
+                    timestamp: order.timestamp,
+                },
+            );
             if remaining == order.qty {
                 OrderStatus::Placed
             } else {
-                OrderStatus::Resting { remaining_qty: remaining }
+                OrderStatus::Resting {
+                    remaining_qty: remaining,
+                }
             }
         }
     }
@@ -105,7 +115,11 @@ impl OrderBook {
     ///
     /// # Panics
     /// Panics in debug mode if `qty == 0`.
-    pub fn add_market_order_into(&mut self, order: MarketOrder, fills: &mut Vec<Fill>) -> OrderStatus {
+    pub fn add_market_order_into(
+        &mut self,
+        order: MarketOrder,
+        fills: &mut Vec<Fill>,
+    ) -> OrderStatus {
         debug_assert!(order.qty > 0, "market order qty must be > 0");
 
         let mut remaining = order.qty;
@@ -183,12 +197,16 @@ impl OrderBook {
     fn refresh_best(&mut self, side: Side) {
         match side {
             Side::Bid => {
-                self.best_bid_cache =
-                    self.bids.last_key_value().map(|(&price, level)| (price, level.total_qty));
+                self.best_bid_cache = self
+                    .bids
+                    .last_key_value()
+                    .map(|(&price, level)| (price, level.total_qty));
             }
             Side::Ask => {
-                self.best_ask_cache =
-                    self.asks.first_key_value().map(|(&price, level)| (price, level.total_qty));
+                self.best_ask_cache = self
+                    .asks
+                    .first_key_value()
+                    .map(|(&price, level)| (price, level.total_qty));
             }
         }
     }
@@ -223,6 +241,39 @@ impl OrderBook {
         self.orders.len()
     }
 
+    /// Live opposing quantity in lots and notional in tick-lots through `limit_price`.
+    ///
+    /// `None` includes the whole opposing side. Canceled quantities do not count.
+    /// The book has no owner metadata, so this includes the taker's resting orders.
+    #[must_use]
+    pub fn executable_depth(&self, taker_side: Side, limit_price: Option<i64>) -> (u64, u128) {
+        let mut qty: u64 = 0;
+        let mut notional: u128 = 0;
+        let mut add = |price: i64, level_qty: u64| {
+            qty += level_qty;
+            notional += u128::from(price.unsigned_abs()) * u128::from(level_qty);
+        };
+        match taker_side {
+            Side::Bid => {
+                for (&price, level) in &self.asks {
+                    if limit_price.is_some_and(|limit| price > limit) {
+                        break;
+                    }
+                    add(price, level.total_qty);
+                }
+            }
+            Side::Ask => {
+                for (&price, level) in self.bids.iter().rev() {
+                    if limit_price.is_some_and(|limit| price < limit) {
+                        break;
+                    }
+                    add(price, level.total_qty);
+                }
+            }
+        }
+        (qty, notional)
+    }
+
     // ── internal matching ──────────────────────────────────────────────
 
     /// Match an incoming bid against resting asks at prices ≤ `limit_price`.
@@ -234,7 +285,9 @@ impl OrderBook {
         fills: &mut Vec<Fill>,
     ) {
         while *remaining > 0 {
-            let Some((ask_price, _)) = self.best_ask_cache else { break };
+            let Some((ask_price, _)) = self.best_ask_cache else {
+                break;
+            };
             if ask_price > limit_price {
                 break;
             }
@@ -251,7 +304,9 @@ impl OrderBook {
         fills: &mut Vec<Fill>,
     ) {
         while *remaining > 0 {
-            let Some((bid_price, _)) = self.best_bid_cache else { break };
+            let Some((bid_price, _)) = self.best_bid_cache else {
+                break;
+            };
             if bid_price < limit_price {
                 break;
             }
@@ -292,7 +347,9 @@ impl OrderBook {
         Self::drain_tombstones(level, &self.orders);
 
         while *remaining > 0 {
-            let Some(front) = level.orders.front_mut() else { break };
+            let Some(front) = level.orders.front_mut() else {
+                break;
+            };
             let fill_qty = (*remaining).min(front.qty);
 
             fills.push(Fill {

@@ -10,9 +10,20 @@ use crate::types::{AgentId, Nanos, Symbol};
 /// decoding exchange-assigned order ids.
 #[derive(Debug, Clone, Copy)]
 pub enum OrderAction {
-    NewLimitOrder { side: cda_engine::Side, price: i64, qty: u64, user_id: u64 },
-    NewMarketOrder { side: cda_engine::Side, qty: u64, user_id: u64 },
-    CancelOrder { order_id: u64 },
+    NewLimitOrder {
+        side: cda_engine::Side,
+        price: i64,
+        qty: u64,
+        user_id: u64,
+    },
+    NewMarketOrder {
+        side: cda_engine::Side,
+        qty: u64,
+        user_id: u64,
+    },
+    CancelOrder {
+        order_id: u64,
+    },
 }
 
 /// A message sent from the exchange back to an agent.
@@ -26,7 +37,13 @@ pub enum ExchangeMessage {
     /// Sent exactly once for every order the exchange creates — including an
     /// order that fully fills at submission — and always before any of its
     /// fills.
-    OrderAccepted { order_id: u64, user_id: u64, symbol: Symbol, side: cda_engine::Side, qty: u64 },
+    OrderAccepted {
+        order_id: u64,
+        user_id: u64,
+        symbol: Symbol,
+        side: cda_engine::Side,
+        qty: u64,
+    },
     /// One fill of the order. `side` is the order owner's side (for a fill
     /// of a resting order, that is the resting order's side). `remaining` is
     /// the order's unfilled quantity AFTER this fill: 0 means the order is
@@ -41,22 +58,46 @@ pub enum ExchangeMessage {
         price: i64,
         qty: u64,
         remaining: u64,
+        /// Exact sum of execution price times quantity, in tick-lots.
+        /// A taker message can cover several matches. Its `price` keeps the last execution price.
+        notional: u128,
     },
-    OrderCancelled { order_id: u64, user_id: u64, symbol: Symbol },
+    OrderCancelled {
+        order_id: u64,
+        user_id: u64,
+        symbol: Symbol,
+    },
     /// A rejected NEW order is reported with `order_id` 0 (no id is ever
     /// allocated for it); its echoed `user_id` and `symbol` still identify
     /// it. A rejected cancel carries the cancel's target `order_id`.
-    OrderRejected { order_id: u64, user_id: u64, symbol: Symbol },
+    OrderRejected {
+        order_id: u64,
+        user_id: u64,
+        symbol: Symbol,
+    },
 }
 
 /// Payload carried by each event in the simulation queue.
 #[derive(Debug)]
 pub enum EventPayload {
-    WakeUp { agent_id: AgentId },
-    OrderArrival { agent_id: AgentId, symbol: Symbol, order: OrderAction },
-    ExchangeResponse { agent_id: AgentId, response: ExchangeMessage },
-    MarketOpen { symbol: Symbol },
-    MarketClose { symbol: Symbol },
+    WakeUp {
+        agent_id: AgentId,
+    },
+    OrderArrival {
+        agent_id: AgentId,
+        symbol: Symbol,
+        order: OrderAction,
+    },
+    ExchangeResponse {
+        agent_id: AgentId,
+        response: ExchangeMessage,
+    },
+    MarketOpen {
+        symbol: Symbol,
+    },
+    MarketClose {
+        symbol: Symbol,
+    },
 }
 
 /// A time-stamped event processed by the kernel.

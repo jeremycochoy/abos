@@ -94,7 +94,7 @@ fn main() {
         symbol: 0,
     };
     for _ in 0..ZI_NB_AGENTS {
-        agents.push(Box::new(ZiAgent::new(zi_cfg.clone(), alloc_seed())));
+        agents.push(Box::new(ZiAgent::new(zi_cfg, alloc_seed())));
     }
 
     // 2) Trend-following agents

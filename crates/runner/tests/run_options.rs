@@ -49,7 +49,7 @@ fn make_agents(symbols: &[Symbol], per_symbol: usize, seed: u64) -> Vec<Box<dyn 
         let cfg = zi_config(symbol);
         for i in 0..per_symbol {
             let agent_seed = seed.wrapping_add(u64::from(symbol) * 1000 + i as u64);
-            agents.push(Box::new(ZiAgent::new(cfg.clone(), agent_seed)));
+            agents.push(Box::new(ZiAgent::new(cfg, agent_seed)));
         }
     }
     agents
@@ -147,7 +147,7 @@ fn bucket_aggregates_equal_a_reference_aggregation_of_the_full_log() {
 fn both_options_together() {
     let cfg = sim_config(7, vec![0]);
     let full = Kernel::run(&cfg, make_agents(&[0], 10, 7));
-    let options = RunOptions { keep_trades: false, l1_bucket_ns: Some(BUCKET_NS) };
+    let options = RunOptions { keep_trades: false, l1_bucket_ns: Some(BUCKET_NS), ..RunOptions::default() };
     let lean = Kernel::run_with(&cfg, make_agents(&[0], 10, 7), &options);
 
     assert!(lean.trades.is_empty());

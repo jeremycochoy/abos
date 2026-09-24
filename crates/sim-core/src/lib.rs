@@ -19,7 +19,9 @@ pub mod types;
 pub use agent::{Agent, AgentAction};
 pub use config::SimulationConfig;
 pub use event::{ExchangeMessage, OrderAction};
-pub use exchange::{Exchange, L1Bucket, L1Snapshot, TradeRecord};
+pub use exchange::{
+    Exchange, FlowBucket, FlowOptions, FlowTotals, L1Bucket, L1Snapshot, TradeRecord,
+};
 pub use kernel::{Kernel, RunOptions, SimulationResult};
 pub use latency::{LatencyConfig, LatencyModel, LatencyModelType};
 pub use output::Candle;
