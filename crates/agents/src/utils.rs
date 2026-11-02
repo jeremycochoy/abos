@@ -137,7 +137,9 @@ mod tests {
     fn geometric_mid_of_odd_spreads_has_no_mean_bias() {
         let errors: Vec<f64> = (4000..4200)
             .flat_map(|bid| [1, 3].map(|spread| (bid, bid + spread)))
-            .map(|(bid, ask)| geometric_mid_price(&snapshot(bid, ask), 0) as f64 - (bid + ask) as f64 / 2.0)
+            .map(|(bid, ask)| {
+                geometric_mid_price(&snapshot(bid, ask), 0) as f64 - (bid + ask) as f64 / 2.0
+            })
             .collect();
         let mean = errors.iter().sum::<f64>() / errors.len() as f64;
         assert!(mean.abs() < 0.01, "mean rounding error {mean} ticks");
@@ -151,9 +153,19 @@ mod tests {
 
     #[test]
     fn geometric_mid_of_a_one_sided_or_empty_book_falls_back() {
-        let one_side = MarketSnapshot { best_bid: Some((100, 1)), best_ask: None, last_trade_price: None, last_trade_time: None };
+        let one_side = MarketSnapshot {
+            best_bid: Some((100, 1)),
+            best_ask: None,
+            last_trade_price: None,
+            last_trade_time: None,
+        };
         assert_eq!(geometric_mid_price(&one_side, 7), 100);
-        let empty = MarketSnapshot { best_bid: None, best_ask: None, last_trade_price: None, last_trade_time: None };
+        let empty = MarketSnapshot {
+            best_bid: None,
+            best_ask: None,
+            last_trade_price: None,
+            last_trade_time: None,
+        };
         assert_eq!(geometric_mid_price(&empty, 7), 7);
     }
 }
