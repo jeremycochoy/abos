@@ -89,18 +89,9 @@ impl MarketMakerAgent {
         raw.clamp(-1.0, 1.0)
     }
 
-    /// Compute mid-price as geometric mean `sqrt(bid * ask)`, matching ABIDES.
-    /// Falls back to one-sided price or reference price when book is empty.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    /// Centre of the quotes: the geometric mid of the book (`utils::geometric_mid_price`).
     fn geometric_mid(snap: &MarketSnapshot, reference: i64) -> i64 {
-        match (snap.best_bid, snap.best_ask) {
-            (Some((bid, _)), Some((ask, _))) => {
-                ((bid as f64 * ask as f64).sqrt().round()) as i64
-            }
-            (Some((bid, _)), None) => bid,
-            (None, Some((ask, _))) => ask,
-            (None, None) => reference,
-        }
+        crate::utils::geometric_mid_price(snap, reference)
     }
 }
 
@@ -468,6 +459,20 @@ mod tests {
         };
         let mid = MarketMakerAgent::geometric_mid(&snap, 10_000);
         assert_eq!(mid, 10_000, "should fall back to reference price");
+    }
+
+    #[test]
+    fn geometric_mid_of_an_odd_spread_rounds_to_the_even_tick() {
+        // A plain round of sqrt(bid * ask) gives 100 and 101: the quotes of a
+        // coarse tick grid then sit half a tick low at each refresh.
+        let book = |bid, ask| MarketSnapshot {
+            best_bid: Some((bid, 100)),
+            best_ask: Some((ask, 100)),
+            last_trade_price: Some(bid),
+            last_trade_time: Some(0),
+        };
+        assert_eq!(MarketMakerAgent::geometric_mid(&book(100, 101), 0), 100);
+        assert_eq!(MarketMakerAgent::geometric_mid(&book(101, 102), 0), 102);
     }
 
     // ── Fill tracking updates inventory by side ─────────────────────

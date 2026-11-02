@@ -3,8 +3,9 @@
 //! Each test folds every output of a seeded run into one u64: the trade log,
 //! the L1 log or buckets, the event count, the result end time, and the
 //! message and wakeup history of a probe agent. The constants were recorded
-//! on master at b98092d. A performance change must keep every fingerprint,
-//! which proves the run byte-identical, event order included.
+//! on master at b98092d, then again with the even rounding of the market-maker
+//! mid (`utils::geometric_mid_price`). A performance change must keep every
+//! fingerprint, which proves the run byte-identical, event order included.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -284,7 +285,7 @@ fn gen88_like_run_keeps_its_fingerprint() {
         true,
         &RunOptions::default(),
     );
-    assert_eq!(got, 0x5be1_136c_e8c0_ab09, "fingerprint changed: {got:#018x}");
+    assert_eq!(got, 0x7a35_b2d5_c0f6_d0b2, "fingerprint changed: {got:#018x}");
 }
 
 #[test]
@@ -294,7 +295,7 @@ fn lean_bucket_run_keeps_its_fingerprint() {
         true,
         &RunOptions { keep_trades: false, l1_bucket_ns: Some(1_000_000_000), flow: None },
     );
-    assert_eq!(got, 0xaa8d_4841_1311_7022, "fingerprint changed: {got:#018x}");
+    assert_eq!(got, 0x5723_bafb_b55d_b22d, "fingerprint changed: {got:#018x}");
 }
 
 #[test]
@@ -304,11 +305,11 @@ fn market_hours_run_keeps_its_fingerprint() {
         false,
         &RunOptions::default(),
     );
-    assert_eq!(got, 0x9c59_ea34_8966_f5cd, "fingerprint changed: {got:#018x}");
+    assert_eq!(got, 0xe8fc_ffd1_69a5_979d, "fingerprint changed: {got:#018x}");
 }
 
 #[test]
 fn no_latency_run_keeps_its_fingerprint() {
     let got = run_fingerprint(LatencyModelType::NoLatency, true, &RunOptions::default());
-    assert_eq!(got, 0xe84d_4df1_e7a4_429e, "fingerprint changed: {got:#018x}");
+    assert_eq!(got, 0x20f3_314f_3da8_0e39, "fingerprint changed: {got:#018x}");
 }
