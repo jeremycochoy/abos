@@ -4,7 +4,9 @@
 //! the L1 log or buckets, the event count, the result end time, and the
 //! message and wakeup history of a probe agent. The constants were recorded
 //! on master at b98092d, then again with the even rounding of the market-maker
-//! mid (`utils::geometric_mid_price`). A performance change must keep every
+//! mid (`utils::geometric_mid_price`), then again with the traded volume in the
+//! L1 log and buckets (the trades and the probe history did not change). A
+//! performance change must keep every
 //! fingerprint, which proves the run byte-identical, event order included.
 
 use std::cell::Cell;
@@ -168,8 +170,11 @@ fn result_fingerprint(result: &SimulationResult, probe_hash: u64) -> u64 {
         h = fold(h, u64::from(s.symbol));
         h = fold_i64(h, s.bid_price);
         h = fold_i64(h, s.ask_price);
-        h = fold(h, s.bid_volume);
-        h = fold(h, s.ask_volume);
+        h = fold(h, s.bid_size);
+        h = fold(h, s.ask_size);
+        h = fold(h, s.volume);
+        h = fold(h, s.quote_volume as u64);
+        h = fold(h, (s.quote_volume >> 64) as u64);
         h = fold_i64(h, s.last_trade_price);
     }
     h = fold(h, result.l1_buckets.len() as u64);
@@ -182,6 +187,7 @@ fn result_fingerprint(result: &SimulationResult, probe_hash: u64) -> u64 {
         h = fold_i64(h, b.first_ask);
         h = fold_i64(h, b.max_ask);
         h = fold_i64(h, b.last_ask);
+        h = fold(h, b.bid_ask_size);
         h = fold(h, b.volume);
         h = fold(h, b.quote_volume as u64);
         h = fold(h, (b.quote_volume >> 64) as u64);
@@ -285,7 +291,7 @@ fn gen88_like_run_keeps_its_fingerprint() {
         true,
         &RunOptions::default(),
     );
-    assert_eq!(got, 0x7a35_b2d5_c0f6_d0b2, "fingerprint changed: {got:#018x}");
+    assert_eq!(got, 0xe588_a20f_d49e_ab1b, "fingerprint changed: {got:#018x}");
 }
 
 #[test]
@@ -295,7 +301,7 @@ fn lean_bucket_run_keeps_its_fingerprint() {
         true,
         &RunOptions { keep_trades: false, l1_bucket_ns: Some(1_000_000_000), flow: None },
     );
-    assert_eq!(got, 0x5723_bafb_b55d_b22d, "fingerprint changed: {got:#018x}");
+    assert_eq!(got, 0x1b03_1078_b932_998e, "fingerprint changed: {got:#018x}");
 }
 
 #[test]
@@ -305,11 +311,11 @@ fn market_hours_run_keeps_its_fingerprint() {
         false,
         &RunOptions::default(),
     );
-    assert_eq!(got, 0xe8fc_ffd1_69a5_979d, "fingerprint changed: {got:#018x}");
+    assert_eq!(got, 0xb8b4_ac63_e8b2_2131, "fingerprint changed: {got:#018x}");
 }
 
 #[test]
 fn no_latency_run_keeps_its_fingerprint() {
     let got = run_fingerprint(LatencyModelType::NoLatency, true, &RunOptions::default());
-    assert_eq!(got, 0x20f3_314f_3da8_0e39, "fingerprint changed: {got:#018x}");
+    assert_eq!(got, 0x576a_7258_71da_0ec3, "fingerprint changed: {got:#018x}");
 }

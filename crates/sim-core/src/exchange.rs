@@ -16,24 +16,29 @@ pub struct TradeRecord {
     pub taker_order_id: u64,
 }
 
-/// L1 best-bid/ask snapshot, recorded on BBO changes.
+/// L1 best-bid/ask snapshot, recorded on a change of the best prices or on a trade.
+/// `bid_size` and `ask_size` are the resting quantities at the best bid and ask.
+/// `volume` and `quote_volume` are the traded quantity and notional of the fills
+/// of the event that records the snapshot.
 #[derive(Debug, Clone, Copy)]
 pub struct L1Snapshot {
     pub timestamp: Nanos,
     pub symbol: Symbol,
     pub bid_price: i64,
     pub ask_price: i64,
-    pub bid_volume: u64,
-    pub ask_volume: u64,
+    pub bid_size: u64,
+    pub ask_size: u64,
+    pub volume: u64,
+    pub quote_volume: u128,
     pub last_trade_price: i64,
 }
 
 /// One k-nanosecond aggregate of the L1 log (issue #8).
 ///
 /// The price fields read the quoted snapshots only, the snapshots with both
-/// sides present; `0` means the bucket saw no quote yet. `volume` and
-/// `quote_volume` sum over every snapshot of the bucket, exactly as the
-/// kline export sums the full log.
+/// sides present; `0` means the bucket saw no quote yet. `bid_ask_size` sums
+/// the best bid and ask sizes of every snapshot of the bucket. `volume` and
+/// `quote_volume` sum the traded quantity and notional of every snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct L1Bucket {
     pub bucket_start: Nanos,
@@ -44,6 +49,7 @@ pub struct L1Bucket {
     pub first_ask: i64,
     pub max_ask: i64,
     pub last_ask: i64,
+    pub bid_ask_size: u64,
     pub volume: u64,
     pub quote_volume: u128,
 }
@@ -61,13 +67,15 @@ impl L1Bucket {
             first_ask: 0,
             max_ask: 0,
             last_ask: 0,
+            bid_ask_size: 0,
             volume: 0,
             quote_volume: 0,
         }
     }
 
-    /// Fold one L1 state into the bucket.
-    pub fn absorb(&mut self, bid_price: i64, ask_price: i64, bid_volume: u64, ask_volume: u64) {
+    /// Fold one L1 snapshot into the bucket.
+    pub fn absorb(&mut self, snapshot: &L1Snapshot) {
+        let (bid_price, ask_price) = (snapshot.bid_price, snapshot.ask_price);
         if bid_price > 0 && ask_price > 0 {
             if self.last_bid == 0 {
                 self.first_bid = bid_price;
@@ -80,9 +88,9 @@ impl L1Bucket {
             self.last_bid = bid_price;
             self.last_ask = ask_price;
         }
-        self.volume += bid_volume + ask_volume;
-        self.quote_volume += u128::try_from(bid_price.max(0)).unwrap_or(0) * u128::from(bid_volume)
-            + u128::try_from(ask_price.max(0)).unwrap_or(0) * u128::from(ask_volume);
+        self.bid_ask_size += snapshot.bid_size + snapshot.ask_size;
+        self.volume += snapshot.volume;
+        self.quote_volume += snapshot.quote_volume;
     }
 }
 
@@ -674,6 +682,8 @@ pub struct Exchange {
     flow: Option<FlowRecorder>,
     /// Reusable fill buffer of [`Self::process_into`].
     fill_buf: Vec<Fill>,
+    /// Traded quantity and notional of the current event, for its L1 snapshot.
+    event_volume: (u64, u128),
 }
 
 impl Exchange {
@@ -696,6 +706,7 @@ impl Exchange {
             open_bucket: None,
             flow: None,
             fill_buf: Vec::new(),
+            event_volume: (0, 0),
         }
     }
 
@@ -902,7 +913,7 @@ impl Exchange {
         }
 
         let bbo_after = (self.book.best_bid(), self.book.best_ask());
-        if bbo_after != bbo_before {
+        if bbo_after != bbo_before || self.event_volume.0 > 0 {
             self.record_l1(time);
         }
     }
@@ -993,6 +1004,8 @@ impl Exchange {
         for fill in fills {
             self.last_trade_price = Some(fill.price);
             self.last_trade_time = Some(time);
+            self.event_volume.0 += fill.qty;
+            self.event_volume.1 += fill_notional(fill);
 
             if let Some(flow) = self.flow.as_mut() {
                 let maker_agent = self
@@ -1151,11 +1164,23 @@ impl Exchange {
     }
 
     fn record_l1(&mut self, time: Nanos) {
-        let (bid_price, bid_volume) = self.book.best_bid_level().unwrap_or((0, 0));
-        let (ask_price, ask_volume) = self.book.best_ask_level().unwrap_or((0, 0));
+        let (bid_price, bid_size) = self.book.best_bid_level().unwrap_or((0, 0));
+        let (ask_price, ask_size) = self.book.best_ask_level().unwrap_or((0, 0));
         if let Some(flow) = self.flow.as_mut() {
             flow.on_quote(time, bid_price, ask_price);
         }
+        let (volume, quote_volume) = std::mem::take(&mut self.event_volume);
+        let snapshot = L1Snapshot {
+            timestamp: time,
+            symbol: self.sym,
+            bid_price,
+            ask_price,
+            bid_size,
+            ask_size,
+            volume,
+            quote_volume,
+            last_trade_price: self.last_trade_price.unwrap_or(0),
+        };
         if let Some(bucket_ns) = self.l1_bucket_ns {
             let bucket_start = time - time % bucket_ns;
             if self.open_bucket.map(|b| b.bucket_start) != Some(bucket_start) {
@@ -1163,19 +1188,11 @@ impl Exchange {
                 self.open_bucket = Some(L1Bucket::new(bucket_start, self.sym));
             }
             if let Some(bucket) = self.open_bucket.as_mut() {
-                bucket.absorb(bid_price, ask_price, bid_volume, ask_volume);
+                bucket.absorb(&snapshot);
             }
             return;
         }
-        self.l1_snapshots.push(L1Snapshot {
-            timestamp: time,
-            symbol: self.sym,
-            bid_price,
-            ask_price,
-            bid_volume,
-            ask_volume,
-            last_trade_price: self.last_trade_price.unwrap_or(0),
-        });
+        self.l1_snapshots.push(snapshot);
     }
 }
 

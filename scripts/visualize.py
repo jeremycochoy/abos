@@ -5,7 +5,7 @@ Usage:
     python scripts/visualize.py [l1_snapshots.parquet]
 
 Reads the L1 snapshots Parquet file produced by the simulation runner,
-resamples to 5-minute bars, and plots bid/ask prices, spread, and volumes.
+resamples to 5-minute bars, and plots bid/ask prices, spread, and traded volume.
 """
 import sys
 from pathlib import Path
@@ -16,7 +16,7 @@ import matplotlib.dates as mdates
 
 
 def load_l1_snapshots(path: str) -> pd.DataFrame:
-    """Load L1 snapshots from Parquet and normalize prices/volumes."""
+    """Load L1 snapshots from Parquet and normalize prices and traded volume."""
     df = pd.read_parquet(path)
 
     # Read tick_size and lot_size from Parquet metadata
@@ -29,14 +29,14 @@ def load_l1_snapshots(path: str) -> pd.DataFrame:
     df["time"] = pd.to_datetime(df["timestamp"], unit="ns")
     df = df.set_index("time")
 
-    # Normalize prices and volumes
+    # Normalize prices and traded volume
     df["bid_price"] = df["bid_price"].astype(float) / tick_size
     df["ask_price"] = df["ask_price"].astype(float) / tick_size
-    df["bid_volume"] = df["bid_volume"].astype(float) / lot_size
-    df["ask_volume"] = df["ask_volume"].astype(float) / lot_size
+    df["volume"] = df["volume"].astype(float) / lot_size
 
-    # Filter out rows where bid or ask is 0 (empty book)
-    df = df[(df["bid_price"] > 0) & (df["ask_price"] > 0)]
+    # No price where bid or ask is 0 (empty book). The row keeps its traded volume.
+    empty = (df["bid_price"] <= 0) | (df["ask_price"] <= 0)
+    df.loc[empty, ["bid_price", "ask_price"]] = float("nan")
 
     # Derived columns
     df["mid_price"] = (df["bid_price"] + df["ask_price"]) / 2
@@ -50,8 +50,7 @@ def resample_5min(df: pd.DataFrame) -> pd.DataFrame:
     resampled = df.resample("300s").agg({
         "bid_price": "last",
         "ask_price": "last",
-        "bid_volume": "sum",
-        "ask_volume": "sum",
+        "volume": "sum",
         "mid_price": "last",
         "spread": "mean",
     }).dropna()
@@ -78,13 +77,11 @@ def plot_l1(df: pd.DataFrame, output: str | None = None):
     ax.set_ylabel("Spread ($)")
     ax.grid(True, alpha=0.3)
 
-    # Panel 3: Volume
+    # Panel 3: Traded volume
     ax = axes[2]
-    ax.bar(df.index, df["bid_volume"], width=0.003, alpha=0.6,
-           color="green", label="Bid volume")
-    ax.bar(df.index, df["ask_volume"], width=0.003, alpha=0.6,
-           color="red", label="Ask volume")
-    ax.set_ylabel("Volume (lots)")
+    ax.bar(df.index, df["volume"], width=0.003, alpha=0.6,
+           color="steelblue", label="Traded volume")
+    ax.set_ylabel("Traded volume (lots)")
     ax.legend(loc="upper right", fontsize=8)
     ax.grid(True, alpha=0.3)
 
