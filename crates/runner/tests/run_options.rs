@@ -58,8 +58,8 @@ fn make_agents(symbols: &[Symbol], per_symbol: usize, seed: u64) -> Vec<Box<dyn 
 /// Rebuild the expected buckets of one symbol from the full L1 log.
 ///
 /// The rules mirror the kline export: the price fields read the quoted
-/// snapshots only (both sides present), the volume and the notional sum over
-/// every snapshot, and a bucket exists when at least one snapshot fell in it.
+/// snapshots only (both sides present), the sizes, the volume and the notional
+/// sum over every snapshot, and a bucket exists when at least one snapshot fell in it.
 fn reference_buckets(snapshots: &[L1Snapshot], symbol: Symbol, bucket_ns: u64) -> Vec<L1Bucket> {
     let mut buckets: Vec<L1Bucket> = Vec::new();
     for snap in snapshots.iter().filter(|s| s.symbol == symbol) {
@@ -68,7 +68,7 @@ fn reference_buckets(snapshots: &[L1Snapshot], symbol: Symbol, bucket_ns: u64) -
             buckets.push(L1Bucket::new(start, symbol));
         }
         let bucket = buckets.last_mut().unwrap();
-        bucket.absorb(snap.bid_price, snap.ask_price, snap.bid_volume, snap.ask_volume);
+        bucket.absorb(snap);
     }
     buckets
 }
@@ -80,8 +80,10 @@ fn assert_same_snapshots(a: &[L1Snapshot], b: &[L1Snapshot]) {
         assert_eq!(x.symbol, y.symbol);
         assert_eq!(x.bid_price, y.bid_price);
         assert_eq!(x.ask_price, y.ask_price);
-        assert_eq!(x.bid_volume, y.bid_volume);
-        assert_eq!(x.ask_volume, y.ask_volume);
+        assert_eq!(x.bid_size, y.bid_size);
+        assert_eq!(x.ask_size, y.ask_size);
+        assert_eq!(x.volume, y.volume);
+        assert_eq!(x.quote_volume, y.quote_volume);
         assert_eq!(x.last_trade_price, y.last_trade_price);
     }
 }
@@ -155,14 +157,36 @@ fn both_options_together() {
     assert_eq!(reference_buckets(&full.l1_snapshots, 0, BUCKET_NS), lean.l1_buckets);
 }
 
+/// One snapshot of symbol 0 at time 0: prices, sizes, traded quantity and notional.
+fn snap(
+    bid_price: i64,
+    ask_price: i64,
+    bid_size: u64,
+    ask_size: u64,
+    volume: u64,
+    quote_volume: u128,
+) -> L1Snapshot {
+    L1Snapshot {
+        timestamp: 0,
+        symbol: 0,
+        bid_price,
+        ask_price,
+        bid_size,
+        ask_size,
+        volume,
+        quote_volume,
+        last_trade_price: 0,
+    }
+}
+
 #[test]
-fn bucket_volumes_count_every_snapshot_and_prices_the_quoted_ones() {
+fn bucket_sums_count_every_snapshot_and_prices_the_quoted_ones() {
     let mut bucket = L1Bucket::new(0, 0);
-    bucket.absorb(0, 0, 0, 0); // empty book: no quote, no volume
-    bucket.absorb(100, 0, 5, 0); // one-sided book: volume and notional, no quote
-    bucket.absorb(101, 103, 4, 6); // first quote
-    bucket.absorb(99, 105, 1, 2); // widens the extremes
-    bucket.absorb(100, 104, 3, 3); // last quote
+    bucket.absorb(&snap(0, 0, 0, 0, 0, 0)); // empty book: no quote, no size
+    bucket.absorb(&snap(100, 0, 5, 0, 2, 200)); // one-sided book: sizes and a trade, no quote
+    bucket.absorb(&snap(101, 103, 4, 6, 0, 0)); // first quote
+    bucket.absorb(&snap(99, 105, 1, 2, 3, 297)); // widens the extremes
+    bucket.absorb(&snap(100, 104, 3, 3, 0, 0)); // last quote
 
     assert_eq!(bucket.first_bid, 101);
     assert_eq!(bucket.first_ask, 103);
@@ -170,19 +194,47 @@ fn bucket_volumes_count_every_snapshot_and_prices_the_quoted_ones() {
     assert_eq!(bucket.max_ask, 105);
     assert_eq!(bucket.last_bid, 100);
     assert_eq!(bucket.last_ask, 104);
-    assert_eq!(bucket.volume, 5 + 4 + 6 + 1 + 2 + 3 + 3);
-    let notional = 100 * 5 + (101 * 4 + 103 * 6) + (99 + 105 * 2) + (100 * 3 + 104 * 3);
-    assert_eq!(bucket.quote_volume, notional);
+    assert_eq!(bucket.bid_ask_size, 5 + 4 + 6 + 1 + 2 + 3 + 3);
+    assert_eq!(bucket.volume, 2 + 3);
+    assert_eq!(bucket.quote_volume, 200 + 297);
 }
 
 #[test]
 fn a_bucket_with_no_quote_keeps_zero_prices() {
     let mut bucket = L1Bucket::new(0, 3);
-    bucket.absorb(0, 0, 0, 0);
-    bucket.absorb(50, 0, 2, 0);
+    bucket.absorb(&snap(0, 0, 0, 0, 0, 0));
+    bucket.absorb(&snap(50, 0, 2, 0, 1, 50));
 
     assert_eq!(bucket.first_bid, 0);
     assert_eq!(bucket.last_ask, 0);
-    assert_eq!(bucket.volume, 2);
-    assert_eq!(bucket.quote_volume, 100);
+    assert_eq!(bucket.bid_ask_size, 2);
+    assert_eq!(bucket.volume, 1);
+    assert_eq!(bucket.quote_volume, 50);
+}
+
+#[test]
+fn the_l1_log_holds_the_volume_of_each_trade_at_its_time() {
+    let cfg = sim_config(42, vec![0, 1]);
+    let full = Kernel::run(&cfg, make_agents(&[0, 1], 6, 42));
+    let mut traded = std::collections::BTreeMap::new();
+    for t in &full.trades {
+        let entry = traded
+            .entry((t.timestamp, t.symbol))
+            .or_insert((0_u64, 0_u128));
+        entry.0 += t.qty;
+        entry.1 += u128::from(t.price.unsigned_abs()) * u128::from(t.qty);
+    }
+    let mut logged = std::collections::BTreeMap::new();
+    for s in full.l1_snapshots.iter().filter(|s| s.volume > 0) {
+        let entry = logged
+            .entry((s.timestamp, s.symbol))
+            .or_insert((0_u64, 0_u128));
+        entry.0 += s.volume;
+        entry.1 += s.quote_volume;
+    }
+    assert!(
+        !traded.is_empty(),
+        "the run must trade, or the test tests nothing"
+    );
+    assert_eq!(traded, logged);
 }

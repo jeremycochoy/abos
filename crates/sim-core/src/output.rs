@@ -62,6 +62,8 @@ pub fn write_trades(
 
 /// Write L1 snapshots to a Parquet file.
 ///
+/// `quote_volume` lands as `Float64`, as in [`write_l1_buckets`].
+///
 /// # Errors
 /// Returns an error if the file cannot be created or written.
 pub fn write_l1_snapshots(
@@ -76,8 +78,10 @@ pub fn write_l1_snapshots(
             Field::new("symbol", DataType::UInt64, false),
             Field::new("bid_price", DataType::Int64, false),
             Field::new("ask_price", DataType::Int64, false),
-            Field::new("bid_volume", DataType::UInt64, false),
-            Field::new("ask_volume", DataType::UInt64, false),
+            Field::new("bid_size", DataType::UInt64, false),
+            Field::new("ask_size", DataType::UInt64, false),
+            Field::new("volume", DataType::UInt64, false),
+            Field::new("quote_volume", DataType::Float64, false),
             Field::new("last_trade_price", DataType::Int64, false),
         ],
         HashMap::from([
@@ -91,8 +95,13 @@ pub fn write_l1_snapshots(
         Arc::new(UInt64Array::from_iter_values(snapshots.iter().map(|s| u64::from(s.symbol)))),
         Arc::new(Int64Array::from_iter_values(snapshots.iter().map(|s| s.bid_price))),
         Arc::new(Int64Array::from_iter_values(snapshots.iter().map(|s| s.ask_price))),
-        Arc::new(UInt64Array::from_iter_values(snapshots.iter().map(|s| s.bid_volume))),
-        Arc::new(UInt64Array::from_iter_values(snapshots.iter().map(|s| s.ask_volume))),
+        Arc::new(UInt64Array::from_iter_values(snapshots.iter().map(|s| s.bid_size))),
+        Arc::new(UInt64Array::from_iter_values(snapshots.iter().map(|s| s.ask_size))),
+        Arc::new(UInt64Array::from_iter_values(snapshots.iter().map(|s| s.volume))),
+        #[allow(clippy::cast_precision_loss)]
+        Arc::new(Float64Array::from_iter_values(
+            snapshots.iter().map(|s| s.quote_volume as f64),
+        )),
         Arc::new(Int64Array::from_iter_values(snapshots.iter().map(|s| s.last_trade_price))),
     ])?;
 
@@ -132,6 +141,7 @@ pub fn write_l1_buckets(
             Field::new("first_ask", DataType::Int64, false),
             Field::new("max_ask", DataType::Int64, false),
             Field::new("last_ask", DataType::Int64, false),
+            Field::new("bid_ask_size", DataType::UInt64, false),
             Field::new("volume", DataType::UInt64, false),
             Field::new("quote_volume", DataType::Float64, false),
         ],
@@ -156,6 +166,7 @@ pub fn write_l1_buckets(
             Arc::new(Int64Array::from_iter_values(chunk.iter().map(|b| b.first_ask))),
             Arc::new(Int64Array::from_iter_values(chunk.iter().map(|b| b.max_ask))),
             Arc::new(Int64Array::from_iter_values(chunk.iter().map(|b| b.last_ask))),
+            Arc::new(UInt64Array::from_iter_values(chunk.iter().map(|b| b.bid_ask_size))),
             Arc::new(UInt64Array::from_iter_values(chunk.iter().map(|b| b.volume))),
             #[allow(clippy::cast_precision_loss)]
             Arc::new(Float64Array::from_iter_values(
@@ -251,11 +262,22 @@ mod tests {
 
     #[test]
     fn l1_buckets_round_trip_through_parquet() {
+        let snap = |bid_price, ask_price, bid_size, ask_size, volume, quote_volume| L1Snapshot {
+            timestamp: 0,
+            symbol: 1,
+            bid_price,
+            ask_price,
+            bid_size,
+            ask_size,
+            volume,
+            quote_volume,
+            last_trade_price: 0,
+        };
         let mut first = L1Bucket::new(0, 1);
-        first.absorb(101, 103, 4, 6);
+        first.absorb(&snap(101, 103, 4, 6, 2, 206));
         let mut second = L1Bucket::new(60_000_000_000, 1);
-        second.absorb(0, 0, 0, 0);
-        second.absorb(99, 105, 1, 2);
+        second.absorb(&snap(0, 0, 0, 0, 0, 0));
+        second.absorb(&snap(99, 105, 1, 2, 3, 309));
         let path = std::env::temp_dir()
             .join(format!("l1_buckets_{}.parquet", std::process::id()));
         write_l1_buckets(&path, &[first, second], 100, 5, 60_000_000_000).unwrap();
@@ -281,12 +303,16 @@ mod tests {
         assert_eq!(int_column("min_bid"), vec![101, 99]);
         assert_eq!(int_column("max_ask"), vec![103, 105]);
         assert_eq!(int_column("last_bid"), vec![101, 99]);
-        let volume = batch.column_by_name("volume").unwrap();
-        let volume = volume.as_any().downcast_ref::<UInt64Array>().unwrap();
-        assert_eq!((volume.value(0), volume.value(1)), (10, 3));
+        let uint_column = |name: &str| -> (u64, u64) {
+            let column = batch.column_by_name(name).unwrap();
+            let values = column.as_any().downcast_ref::<UInt64Array>().unwrap();
+            (values.value(0), values.value(1))
+        };
+        assert_eq!(uint_column("bid_ask_size"), (10, 3));
+        assert_eq!(uint_column("volume"), (2, 3));
         let notional = batch.column_by_name("quote_volume").unwrap();
         let notional = notional.as_any().downcast_ref::<Float64Array>().unwrap();
-        assert!((notional.value(0) - 1022.0).abs() < 1e-9);
+        assert!((notional.value(0) - 206.0).abs() < 1e-9);
         assert!((notional.value(1) - 309.0).abs() < 1e-9);
     }
 }
